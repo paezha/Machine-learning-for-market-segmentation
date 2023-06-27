@@ -1,0 +1,1612 @@
+---
+title: Using machine learning to identify spatial market segments. A reproducible study of major Spanish markets
+runninghead: authors \emph{et al}.
+author:
+- name: D. Rey-Blanco
+  num: 1
+- name: P. Arbues
+  num: 1
+- name: F. López
+  num: 2
+- name: A. Páez*
+  num: 3
+address:
+- num: 1
+  org: Idealista, Plaza de las Cortes 5, 28014 Madrid, Spain
+- num: 2
+  org: Facultad de CC de la Empresa, C/ Real, 3. 30201 Cartagena, Murcia, Spain
+- num: 3
+  org: School of Earth, Environment and Society, McMaster University, 1280 Main St W, Hamilton, Ontario L8S 4K1 Canada
+corrauth: "Antonio Páez, School of Earth, Environment and Society, McMaster University, 1280 Main St W, Hamilton, Ontario L8S 4K1 Canada."
+email: paezha@mcmaster.ca
+abstract: "Identifying market segments can improve the fit and performance of hedonic price models. In this paper, we present a novel approach to market segmentation based on the use of machine learning techniques. Concretely, we propose a two-stage process. In the first stage, classification trees with interactive basis functions are used to identify non-orthogonal and non-linear sub-market boundaries. The market segments that result are then introduced in a spatial econometric model to obtain hedonic estimates of the implicit prices of interest. The proposed approach is illustrated with a reproducible example of three major Spanish real estate markets. We conclude that identifying market subsegments using the approach proposed is a relatively simple and demonstrate the potential of the proposed modelling strategy to produce better models and more accurate predictions."
+
+keywords: Hedonic prices; market segments; decision trees; spatial econometrics; reproducible research;
+classoption:
+  - Royal
+  - times
+bibliography: bibliography.bib
+bibliographystyle: sageh
+output:
+  rticles::sage_article:
+    keep_tex: yes
+---
+<!-- whoppeR::load_knitr_cache('/Users/fernandoair/Dropbox/Machine-Learning-and-Spatial-Econometrics-Hedonic-Analysis/EPB/EPB_cache/latex') -->
+
+```{r install-data-package, include = FALSE}
+# Run only once if needed to install data package `sobiEquity`
+if (!require("idealista18", character.only = TRUE)) {
+      devtools::install_github("https://github.com/paezha/idealista18")
+  }
+```
+
+```{r setup,  cache=FALSE, warning = FALSE, include=FALSE, message = FALSE}
+library(fastDummies) # Fast Creation of Dummy (Binary) Columns and Rows from Categorical Variables
+library(geosphere) # Spherical Trigonometry
+library(here) # A Simpler Way to Find Your Files
+library(idealista18) # Idealista 2018 Data Package
+library(kableExtra) # Construct Complex Table with 'kable' and Pipe Syntax
+library(lmtest) # Testing Linear Regression Models
+library(Metrics) # Evaluation Metrics for Machine Learning
+library(spatialreg) # Spatial Regression Analysis
+library(spdep) # Spatial Dependence: Weighting Schemes, Statistics
+library(sf) # Simple Features for R
+library(tidyverse) # Easily Install and Load the 'Tidyverse'
+library(tree) # Classification and Regression Trees
+```
+
+```{r seed-for-replicability, include=FALSE}
+config <- list()
+config$seed <- 2342324 # For replicability
+```
+
+```{r split-proportion, include=FALSE}
+config$Train_Split_Proportion <- 0.7
+```
+
+```{r define-performance-metrics, include=FALSE}
+#' Compute various performance metrics for a regression model
+#'
+#' @param truth A simple features data frame with the data for model estimation.
+#' @param predictions The proportion of the sample for training, a number between 0 and 1.
+#' @param model_label A label for the model
+#' @param split_label A label for the data split used
+#' @return A list with various performance metrics.
+#' @import Metrics
+#' @importFrom dplyr %>%
+#' @importFrom stats median
+#' @export
+#' @examples
+#'
+#' library(idealista18) # Idealista 2018 Data Package
+#' data(Valencia_Sale)
+#' mod <- lm(LOGPRICE ~ CONSTRUCTEDAREA, data = Valencia_Sale)
+#' perf_reg_metrics(truth = Valencia_Sale$LOGPRICE, predictions = mod$fitted.values)
+
+# #' @import dplyr Metrics
+
+perf_reg_metrics <- function(truth, predictions, model_label = "", split_label = ""){
+  #COMPUTES PERFORMANCE METRICS FOR REGRESSION MODELS
+  ae <- Metrics::ae(truth, predictions)
+  ape <- Metrics::ape(truth, predictions)
+
+
+  hit_ratio <- data.frame(ape) %>%
+    dplyr::summarise(n = dplyr::n(),
+                     hit_ratio_5 = sum(. < 0.05)/n,
+                     hit_ratio_10 = sum(. < 0.1)/n,
+                     hit_ratio_20 = sum(. < 0.2)/n,
+                     hit_ratio_50 = sum(. < 0.5)/n)
+
+  metrics <- data.frame(estimator = model_label,
+                        split = split_label,
+                        mae = Metrics::mae(
+                          truth,
+                          predictions),
+                        mdae = median(ae),
+                        rmse = Metrics::rmse(
+                          truth,
+                          predictions),
+                        mape = Metrics::mape(
+                          truth,
+                          predictions),
+                        medape = median(ape),
+                        bias = Metrics::bias(
+                          truth,
+                          predictions),
+                        pc_bias = Metrics::percent_bias(
+                          truth,
+                          predictions))
+
+  all.metrics <- cbind(hit_ratio, metrics)  %>%
+    dplyr::select(estimator, split, n,
+                  mae, mdae, rmse,
+                  mape, medape, bias, pc_bias,
+                  hit_ratio_5, hit_ratio_10, hit_ratio_20, hit_ratio_50
+    )
+
+
+  return(all.metrics)
+}
+```
+
+```{r base-code-preparation, include=FALSE, eval=FALSE}
+
+# This is the base code for preparing the data for analysis
+# IMPORTANT: THESE CHUNKS ARE NOT EVALUATED HERE - KEEP eval=FALSE
+
+#################
+# Preliminaries #
+#################
+
+# Extract UTM coordinates:
+coords.utm <- assets.sf %>% 
+  st_transform(crs = 32630) %>%
+  st_coordinates()
+
+# Add UTM coordinates to `assets.sf`:
+assets.sf <- cbind(assets.sf, coords.utm)
+
+# Center and scale coordinates for work with regression trees. Center on city center:
+max.range <- max(max(assets.sf$X) - min(assets.sf$X),
+                 max(assets.sf$Y) - min(assets.sf$Y))
+
+# Obtain coordinates of City Center in UTM:
+city.center.utm <- st_point(c(pois.df.list$City_Center$Lon,pois.df.list$City_Center$Lat)) %>%
+  st_sfc(crs = 4326) %>%
+  st_transform(crs = 32630) %>%
+  st_coordinates()
+
+# Center and scale coordinates for work with regression trees. Center on City Center, 
+# scale by maximum range of observation:
+assets.sf <- assets.sf %>%
+  mutate(X = (X - city.center.utm[1])/max.range, 
+         Y = (Y - city.center.utm[2])/max.range)
+
+# Add interactions as per the IBF approach (see Paez, Lopez, Ruiz, Camacho, 2019):
+assets.sf <- assets.sf %>%
+  mutate(LOGPRICE = log(PRICE),
+         X_p_Y = X + Y, 
+         X2_p_Y2 = X^2 + Y^2,
+         X_x_Y = X * Y, 
+         X2 = X^2, Y2 = Y^2)
+
+# Data frame after dropping geometry
+assets.df <- assets.sf %>%
+  st_drop_geometry()
+
+# Set seed for replicability
+set.seed(config$seed)
+
+# Proportion of sample for training the models 
+train.splits <- sample(1:dim(assets.sf)[1],
+                         size=round(dim(assets.df)[1]*config$Train_Split_Proportion))
+
+# Rownames used for prediction
+rn <- row.names(assets.sf)
+rn.train <- as.numeric(rn[train.splits])
+rn.test <- as.numeric(rn[-train.splits])
+
+# Train and test sf data.frames
+assets.train.sf <- assets.sf[train.splits,]
+assets.test.sf <- assets.sf[-train.splits,]
+
+# Train and test df data.frames
+assets.train.df <- assets.train.sf %>% 
+  st_drop_geometry()
+assets.test.df <- assets.test.sf %>% 
+  st_drop_geometry()
+```
+
+```{r base-code-spatial-weights, include=FALSE, eval=FALSE}
+
+# This is the base code for preparing the spatial weights for the spatial econometric models
+# IMPORTANT: THESE CHUNKS ARE NOT EVALUATED HERE - KEEP eval=FALSE
+
+###################
+# Spatial weights #
+###################
+
+# Coordinates of training sample
+coords <- assets.train.df %>%
+  dplyr::select(LONGITUDE, LATITUDE) %>%
+  data.matrix()
+
+# K-nearest neighbors in training sample
+list.train.W6 <- coords %>%
+  knearneigh(longlat = TRUE, k = 6) %>%
+  knn2nb() #%>%
+
+# Distances of nearest neighbors
+k.distances <- nbdists(list.train.W6, 
+                       coords)
+# Inverse distance
+invd2a <- lapply(k.distances, 
+                 function(x) (1/(x/100)))
+
+# List of neighbors in row-standardized inverse distance of nearest neighbors
+list.train.W6 <- nb2listw(list.train.W6,
+                             glist = invd2a)
+attr(list.train.W6, "region.id") <- rn.train
+
+# Coordinates of test sample
+coords <- assets.test.df %>%
+  dplyr::select(LONGITUDE, LATITUDE) %>%
+  data.matrix()
+
+# List of neighbors test sample
+list.test.W6 <- coords %>%
+  knearneigh(longlat = TRUE, k = 6) %>%
+  knn2nb() 
+
+# Distances of nearest neighbors
+k.distances <- nbdists(list.test.W6, 
+                       coords)
+# Inverse distance
+invd2a <- lapply(k.distances, 
+                 function(x) (1/(x/100)))
+
+# List of neighbors in row-standardized inverse distance of nearest neighbors
+list.test.W6 <- nb2listw(list.test.W6,
+                             glist = invd2a)
+attr(list.test.W6, "region.id") <- rn.train
+
+# Coordinates of full sample
+coords <- assets.df %>%
+  dplyr::select(LONGITUDE, LATITUDE) %>%
+  data.matrix()
+
+# List of neighbors full sample
+list.W6 <- coords %>%
+  knearneigh(longlat = TRUE, k = 6) %>%
+  knn2nb() 
+
+# Distances of nearest neighbors
+k.distances <- nbdists(list.W6, 
+                       coords,
+                       longlat = TRUE)
+# Inverse distance
+invd2a <- lapply(k.distances, 
+                 function(x) (1/(x/100)))
+
+# List of neighbors in row-standardized inverse distance of nearest neighbors
+list.W6 <- nb2listw(list.W6,
+                    glist = invd2a)
+attr(list.W6, "region.id") <- 1:dim(assets.sf)[1]
+```
+
+```{r base-code-analysis, include=FALSE, eval=FALSE}
+
+# This is the base code for the analysis
+# IMPORTANT: THESE CHUNKS ARE NOT EVALUATED HERE - KEEP eval=FALSE
+
+# Define the formula for the models
+model.formula <- as.formula(paste(config$Target_Variable, "~ ",
+      paste(str_split(config$Features$Basic, " "), collapse=" + "),
+      sep = ""))
+
+#############################################
+# Spatial Submarkets                        #
+#############################################
+
+# Estimate complete regression tree with coordinates and interactive basis functions. Summarize the results:
+submarkets.reg.tree.model <- tree(as.formula(paste(config$Target_Variable,
+                                                   "~  X + Y + X_p_Y + X2_p_Y2 + X_x_Y")), 
+                                  data = assets.train.sf)
+# Create prediction grid:
+grid1 <- st_make_grid(neighborhoods_polygons %>%
+                        st_transform(crs = 32630), 
+                      n = 100, 
+                      what = "centers") %>% 
+  st_sf()
+
+# Clip prediction grid:
+grid1 <- grid1[neighborhoods_polygons %>%
+                        st_transform(crs = 32630),]
+
+grid1 <- grid1 %>%
+#  st_transform(crs = 32630) %>%
+  st_coordinates() %>%
+  cbind(grid1) %>%
+  mutate(X = (X - city.center.utm[1])/max.range, 
+         Y = (Y - city.center.utm[2])/max.range)
+
+grid1 <- grid1 %>%
+  mutate(X_p_Y = X + Y, 
+         X2_p_Y2 = X^2 + Y^2,
+         X_x_Y = X * Y)
+
+grid1$pred <- predict(submarkets.reg.tree.model, 
+                      newdata = grid1)
+
+z.label.names <- c(paste0("Z", 1:length(unique(grid1$pred))))
+
+grid1$market_segment <- factor(grid1$pred,
+                             labels = z.label.names)
+
+# Append market segments to data frames
+assets.train.sf$market_segment <- factor(predict(submarkets.reg.tree.model, 
+                                        newdata = assets.train.sf), 
+                                      labels = z.label.names)
+
+assets.test.sf$market_segment <- factor(predict(submarkets.reg.tree.model, 
+                                        newdata = assets.test.sf), 
+                                      labels = z.label.names)
+
+##########################################
+# Model 1: Basic Econometric Methodology #
+##########################################
+
+# Estimate base LM model
+base.model <- lm(model.formula,
+                 assets.train.sf)
+
+# Predict using base LM
+base.model.train.preds <- predict(base.model)
+base.model.test.preds <- predict(base.model,
+                                 newdata = assets.test.df)
+
+# Compute Moran I
+# base.model.moran.i <- moran.test(base.model$residuals, list.train.W6)
+# base.model.moran.i
+
+# Compute performance on train split
+performance.metrics.df <- perf_reg_metrics(assets.train.df$LOGPRICE,
+                                     base.model.train.preds,
+                                     model_label = "01. Base LM",
+                                     split = "Train")
+
+# Compute performance on test split
+performance.metrics.df <- rbind(performance.metrics.df,
+                                perf_reg_metrics(assets.test.df$LOGPRICE,
+                                     base.model.test.preds,
+                                     model_label = "01. Base LM",
+                                     split = "Test"))
+
+# #######################################################
+# # Model 2: Estimate linear model with market segments # 
+# #######################################################
+
+linear.market.segments <- lm(as.formula(paste(config$Target_Variable, 
+                                                    "~ market_segment + ",
+                                                    paste(str_split(config$Features$Basic, " "), 
+                                                          collapse=" + "),
+                                                    sep = "")),
+                                   assets.train.sf)
+#summary(linear.market.segments)
+
+# Predict using LM with market segments
+linear.market.segments.train.preds <- predict(linear.market.segments)
+linear.market.segments.test.preds <- predict(linear.market.segments,
+                                                   newdata = assets.test.sf)
+# Compute Moran I
+#linear.market.segments.moran.i <- moran.test(linear.market.segments$residuals, list.train.W6)
+#linear.market.segments.moran.i
+
+# Compute trace
+list.train.W6.sparse <- as(list.train.W6, "CsparseMatrix")
+tr.list.train.W6 <- spatialreg::trW(list.train.W6.sparse, type = "MC")
+
+# Compute performance on train split
+performance.metrics.df <- rbind(performance.metrics.df,
+                                perf_reg_metrics(assets.train.df$LOGPRICE,
+                                     linear.market.segments.train.preds,
+                                     model_label = "02. LM MS",
+                                     split = "Train"))
+
+# Compute performance on test split
+performance.metrics.df <- rbind(performance.metrics.df,
+                                perf_reg_metrics(assets.test.df$LOGPRICE,
+                                     linear.market.segments.test.preds,
+                                     model_label = "02. LM MS",
+                                     split = "Test"))
+
+# #########################################################################
+# # Model 3: Spatial Econometric Model. Prediction TC/BP/BPN              #
+# #########################################################################
+
+# Estimate Spatial Econometric with Surface Trend
+sarlm.control <- list(fdHess=TRUE)
+spatial.model <- spatialreg::lagsarlm(
+                        formula = model.formula,
+                        data = assets.train.sf,
+                        list.train.W6,
+                        method = "MC",
+                        control=sarlm.control,
+                        zero.policy = TRUE)
+
+# Predictions computation in sample
+spatial.model.train.preds.TC <- predict(spatial.model,
+                                        newdata = assets.train.sf,
+                                        listw = list.train.W6,
+                                        pred.type ="TC")
+spatial.model.train.preds.BP <- predict(spatial.model,
+                                        newdata = assets.train.sf,
+                                        listw = list.train.W6,
+                                        pred.type ="BP")
+
+# Predictions computation out of sample
+# spatial.model.test.preds.TC <- predict(spatial.model,
+#                                        newdata = assets.test.sf,
+#                                        listw = list.W6,
+#                                        pred.type ="TC")
+spatial.model.test.preds.BP <- predict(spatial.model,
+                                       newdata = assets.test.sf,
+                                       listw = list.W6,
+                                       pred.type ="BP")
+# spatial.model.test.preds.BPN <- predict(spatial.model,
+#                                         newdata = assets.test.sf,
+#                                         listw = list.W6,
+#                                         pred.type ="BPN")
+# spatial.model.test.preds.BPW <- predict(spatial.model.2, newdata = assets.test.sf, listw = list.W6, pred.type ="BPW")
+# spatial.model.test.preds.TS <- predict(spatial.model,
+#                                        newdata = assets.test.sf,
+#                                        listw = list.W6,
+#                                        pred.type ="TS",
+#                                        zero.policy = TRUE)
+
+# #Compute Moran I
+#spatial.model.moran.i <- moran.test(spatial.model$residuals, list.train.W6)
+#spatial.model.moran.i
+
+#Compute performance on train split
+# performance.metrics.df <- rbind(performance.metrics.df,
+#                                 perf_reg_metrics(exp(assets.train.df$LOGPRICE),
+#                                      exp(spatial.model.train.preds.TC),
+#                                      model_label = "03. Spatial Model TC",
+#                                      split = "Train"))
+performance.metrics.df <- rbind(performance.metrics.df,
+                                perf_reg_metrics(assets.train.df$LOGPRICE,
+                                     spatial.model.train.preds.BP,
+                                     model_label = "03. Spatial Model (BP)",
+                                     split = "Train"))
+
+#Compute performance on test split
+# performance.metrics.df <- rbind(performance.metrics.df,
+#                                 perf_reg_metrics(exp(assets.test.df$LOGPRICE),
+#                                      exp(spatial.model.test.preds.TC),
+#                                      model_label = "03. Spatial Model TC",
+#                                      split = "Test"))
+performance.metrics.df <- rbind(performance.metrics.df,
+                                perf_reg_metrics(assets.test.df$LOGPRICE,
+                                     spatial.model.test.preds.BP,
+                                     model_label = "03. Spatial Model (BP)",
+                                     split = "Test"))
+# performance.metrics.df <- rbind(performance.metrics.df,
+#                                 perf_reg_metrics(exp(assets.test.df$LOGPRICE),
+#                                      exp(spatial.model.test.preds.BPN),
+#                                      model_label = "03. Spatial Model BPN",
+#                                      split = "Test"))
+# performance.metrics.df <- rbind(performance.metrics.df,
+#                                 perf_reg_metrics(exp(assets.test.df$LOGPRICE),
+#                                      exp(spatial.model.test.preds.TS),
+#                                      model_label = "03. Spatial Model TS",
+#                                      split = "Test"))
+
+# ####################################################################################################
+# # Model 4: Spatial Econometric with Market Segments. Prediction TC/BP/BPN/TS                       #
+# ####################################################################################################
+
+# Estimate Spatial Econometric with Surface Trend
+# Fit model
+sarlm.control <- list(fdHess=TRUE)
+spatial.market.segments <- spatialreg::lagsarlm(
+                        formula = as.formula(paste(config$Target_Variable, 
+                                                    "~ market_segment + ",
+                                                    paste(str_split(config$Features$Basic, " "), 
+                                                          collapse=" + "),
+                                                    sep = "")),
+                        data=assets.train.sf,
+                        list.train.W6,
+                        method = "MC",
+                        control=sarlm.control,
+                        zero.policy = TRUE)
+
+# Predictions computation in sample
+# spatial.market.segments.train.preds.TC <- predict(spatial.market.segments,
+#                                                                 newdata = assets.train.sf,
+#                                                                 listw = list.train.W6,
+#                                                                 pred.type ="TC")
+spatial.market.segments.train.preds.BP <- predict(spatial.market.segments,
+                                                                newdata = assets.train.sf,
+                                                                listw = list.train.W6,
+                                                                pred.type ="BP")
+
+# Predictions computation out of sample
+# spatial.market.segments.test.preds.TC <- predict(spatial.market.segments,
+#                                                                newdata = assets.test.sf,
+#                                                                listw = list.W6,
+#                                                                pred.type ="TC")
+spatial.market.segments.test.preds.BP <- predict(spatial.market.segments,
+                                                               newdata = assets.test.sf,
+                                                               listw = list.W6,
+                                                               pred.type ="BP")
+# spatial.market.segments.test.preds.BPN <- predict(spatial.market.segments,
+#                                                                 newdata = assets.test.sf,
+#                                                                 listw = list.W6,
+#                                                                 pred.type ="BPN")
+# spatial.market.segments.test.preds.TS <- predict(spatial.market.segments,
+#                                                                newdata = assets.test.sf,
+#                                                                listw = list.W6,
+#                                                                pred.type ="TS",
+#                                                                zero.policy = TRUE)
+
+#spatial.market.segments.moran.i <- moran.test(spatial.market.segments$residuals, list.train.W6)
+#spatial.market.segments.moran.i
+
+# Compute performance on train split
+# performance.metrics.df <- rbind(performance.metrics.df,
+#                                 perf_reg_metrics(exp(assets.train.df$LOGPRICE),
+#                                      exp(spatial.market.segments.train.preds.TC),
+#                                      model_label = "04. SMS TC",
+#                                      split = "Train"))
+performance.metrics.df <- rbind(performance.metrics.df,
+                                perf_reg_metrics(assets.train.df$LOGPRICE,
+                                     spatial.market.segments.train.preds.BP,
+                                     model_label = "04. Spatial Model + MS (BP)",
+                                     split = "Train"))
+
+# Compute performance on test split
+# performance.metrics.df <- rbind(performance.metrics.df,
+#                                 perf_reg_metrics(exp(assets.test.df$LOGPRICE),
+#                                      exp(spatial.market.segments.test.preds.TC),
+#                                      model_label = "04. SMS TC",
+#                                      split = "Test"))
+performance.metrics.df <- rbind(performance.metrics.df,
+                                perf_reg_metrics(assets.test.df$LOGPRICE,
+                                     spatial.market.segments.test.preds.BP,
+                                     model_label = "04. Spatial Model + MS (BP)",
+                                     split = "Test"))
+# performance.metrics.df <- rbind(performance.metrics.df,
+#                                 perf_reg_metrics(exp(assets.test.df$LOGPRICE),
+#                                      exp(spatial.market.segments.test.preds.BPN),
+#                                      model_label = "04. SMS BPN",
+#                                      split = "Test"))
+# performance.metrics.df <- rbind(performance.metrics.df,
+#                                 perf_reg_metrics(exp(assets.test.df$LOGPRICE),
+#                                      exp(spatial.model.test.preds.TS),
+#                                      model_label = "04. SMS TS",
+#                                      split = "Test"))
+```
+
+\newpage
+
+
+Introduction
+==========================
+
+Hedonic price analysis is one of the most widely-used approaches for the study and valuation of properties in real estate markets. This approach is attractive due to its strong theoretical grounding and appealing interpretation [@Rosen1974hedonic]. Indeed, when hedonic price models are estimated using multiple linear regression the coefficients of the model are thought to capture the implicit prices of attributes in a bundled good. In this way, while a room may lack an explicit price in the valuation of a property, the coefficient of a hedonic price model quantifies its implicit value. Such decomposition of the price of a bundled good into the implicit prices of its constituent parts is important for multiple reasons: this analysis is the industry standard for property assessment for tax purposes [@Morillo2017application]; these models are used to quantify the willingness to pay for non-market environmental amenities [@Montero2018estimating], including air quality and open spaces and similarly they can be used to assess the cost of disamenities [e.g., @vonGraevenitz2018amenity].
+
+The need to assess property values in a transparent, accurate, and precise way has led to numerous developments. A strand of research has aimed at enhancing the performance of models by incorporating spatial information. Geographic Information Systems (GIS) in particular have been used to make explicit some attributes of properties and their environments that might otherwise be overlooked [@Paterson2002out]. The use of spatial data, in turn, has brought increased attention to the question of statistical sufficiency and therefore the need for approaches that appropriately consider the issues of spatial association and spatial heterogeneity in hedonic price analysis [@Pace1997spatial; @Paez2001spatial]. As a result, there has been a proliferation of studies that apply spatial statistical or econometric methods to the issue of property valuation [@Paez2009recent]. Recent applications include the use of hierarchical spatial autoregressive models [@Cellmer2019application], moving windows approaches [@Paez2008moving], spatial filtering [@Helbich2016spatially], and kriging techniques [@Montero2009estimating], among others.
+
+In addition to interest in spatial data, the application of machine learning techniques for hedonic price analysis has also become an active topic of research. There are at least two distinct ways in which machine learning can be used for hedonic price analysis. In some studies, the role of machine learning algorithms is to process information that would otherwise be difficult or impossible to obtain using non-automated means. The information obtained is then used as an input in econometric hedonic models. For example, @Humphreys2019superstition and @Nowak2018homeowner used machine learning classifiers to ethnically profile buyers and sellers based on last names to understand whether potential cultural biases and/or discrimination issues exist in property transactions. In other research, machine learning algorithms replace the conventional hedonic price model [@Hu2019monitoring; @Yoo2012variable;  @Fuss2016role]. The evidence available shows that machine learning methods can perform remarkably well, but can also be seen as black boxes^[An emergent body of research aims at increasing the interpretability of machine learning methods, including @du2019techniques and @murdoch2019definitions, among others. This is an area of research that is quickly evolving, although it is not without critics [e.g., @rudin2019stop]. Currently, existing approaches depend on fairly strong assumptions. For example, the causal forest framework [@wager2018estimation; @knaus2021machine] assumes that the leaves of trees are sufficiently small to mimic a randomized experiment. Assuming independence is often inappropriate in the analysis of spatial data, and econometric techniques that correctly treat spatial dependencies are mature. It is possible that in the future interpretable machine learning techniques will address spatial dependencies as well, so we are advised to pay attention to this stream of research.] with low interpretability [see page 25 in @James2013introduction]. 
+
+Our objective in this paper is to introduce a novel approach that retains the interpretability of econometric approaches, but is enhanced by the identification of spatial market segments obtained from the use of machine learning techniques. We propose a two-stage approach. In the first stage, classification trees are implemented to identify homogeneous spatial market segments. The number of market segments is endogenous, and, compared to @Fuss2016role, the use of interactive basis functions [see @Paez2019inducing] can accommodate non-orthogonal and non-linear decision boundaries. The market segments are then introduced as covariates in an econometric model. This approach can potentially enhance the model without compromising its interpretability. 
+
+A reproducible case study of property values in three major markets in Spain helps to illustrate the proposed approach. Following recommendations for openness and reproducibility in geospatial research [@Paez2021open], this paper is accompanied by a fully documented and open data product [see @arribas2021open], and the code is embedded in a self-contained Rmarkdown document. The results show that modeling prices using the approach proposed to identify spatial market segments improves the fit of the models and can in addition enhance the quality of predictions.
+
+<!--
+Use machine learning to predict prices: @Hu2019monitoring; @Ceh2018estimating compare random forests versus multiple regression; @Chen2017forecasting use support vector machine to forecast prices; @Yoo2012variable use Cubist and Random Forest (RF) for variable selection and modelling of prices;  @Perez2019machine use machine learning to estimate prices
+
+@Balsera2018artificial, @Feng2015comparing; @Fuss2016role
+-->
+
+Spatial Market Segmentation
+===================
+
+The importance of housing submarkets has long been recognized in the literature [e.g. @Rapkin1953housing]. Market differentiation can be the result of a variety of processes operating separately or in conjunction, including substitution, differentiation, and variations in consumer preferences [@Galster1996william]. In principle, this implies a degree of homogeneity within the market segment that differentiates it from other segments. According to Thibodeau [-@Thibodeau2003marking, pp. 4-5] a spatial housing submarket "defines a geographic area where the price of housing per unit of housing service is constant". Given the non-tradeable nature of location, research has shown the relevance of spatial market segments [@Bourassa2007spatial; @Royuela2013heuristic; @Usman2020property]. 
+
+Submarket analysis is often implemented in a pragmatic way, encompassing regional boundaries, for instance those of metropolitan regions, cities, or municipalities. It has long been recognized, though, that sub-markets may exist at smaller scales [e.g., @Rapkin1953housing]. In particular, the pioneering work of Alonso [@Alonso1964location] on urban structure led to the realization of the importance of geography in terms of differentiation of real estate property. Since then, vast amounts of empirical evidence have contributed to demonstrate just how commonplace differences in hedonic prices are at the intraurban scale. Concurrently, market segmentation has been shown to be not only a conceptually sound practice [see @Watkins2001definition], but also conducive to higher quality models and improved predictive performance, in particular when geography is explicitly taken into consideration [@Paez2008moving].
+
+Numerous approaches have been proposed to identify market segments. Some are based on expert opinion, such as from appraisers [@Wheeler2014bayesian]. Many others are data-driven, using statistical or machine learning techniques [e.g., @Helbich2013data; @Wu2018modified]. Heuristic approaches also exist that exploit the latent homogeneity in values [@Royuela2013heuristic]. Implementation of market segments in hedonic price models can be accomplished by means of fixed effects (i.e., dummy variables)  for sub-regions [e.g., @Bourassa2007spatial], spatial drift by means of a trend surface [e.g. @Pace1997spatial], spatially autoregressive models [e.g., @Pace1998spatiotemporal], switching regressions [e.g., @Islam2011addressing; @Paez2001spatial], multilevel and/or Bayesian models [e.g., @Wheeler2014bayesian], or by means of spatially moving windows or non-parametric techniques to obtain soft market segments [@Paez2008moving; @Hwang2009delineating]. As is commonly the case, there is no one technique that performs consistently better than the alternatives in every case, since performance depends to some extent on the characteristics of the process being modeled [@Usman2020property]. It is therefore valuable to explore alternative approaches to identify and model market segments, to further enrich the repertoire of techniques available to analysts.
+
+A recent proposal along these lines is due to @Fuss2016role, who suggest using decision trees to identify and model market segments. @James2013introduction list some attractive features of decision trees. They are relatively simple to estimate and intuitive to interpret. They divide attribute space into a set of mutually exclusive and collectively exhaustive regions, and thus are ideally suited for market segmentation. By design, the regions generated are spatially compact and internally homogeneous. And they can outperform other regression techniques. Market segments derived from a decision tree can be used in combination with other modeling techniques, such as a second-stage tree regression (with fixed effects for the market segments from the preliminary tree regression), linear models, or models with spatial or spatio-temporal effects, such as space-time autoregression. @Fuss2016role compare several different modeling techniques. Their findings confirm that introducing a form of market segmentation greatly improves prediction accuracy, and the use of tree-based market segments does so more than the use of an _a priori_ zoning system defined by ZIP codes. Furthermore, accounting for residual spatial pattern in the form of a spatial autoregressive model further improves the accuracy of estimation.
+
+The results reported by @Fuss2016role are appealing. However, the modeling strategy that they implement inherits a limitation of tree regression, namely the relatively inflexible way in which attribute space is partitioned using recursive binary splits. What this means is that market segments obtained in this way are limited to linear and orthogonal boundaries [see page 1359 in @Fuss2016role]. While prediction accuracy reportedly improves with tree-based segmentation of the market, it might be desirable to define market segments more flexibly, so that they are not constrained to rectangular shapes. Secondly, estimates of a regression tree are the mean of the values contained in the volume of a leaf, which means they are constants for each leaf. In a geographical application the leaves are mutually exclusive and collectively exhaustive partitions of geographical space. Using the residuals in the second step of the modelling strategy induces spatial autocorrelation, since all properties in the same segment will be given estimated residuals that are constants in each market segment. The issue here is that by introducing spatial autocorrelation in the second step some of the spatial information about location is obscured since there is zero spatial variation in the estimated residuals for a given market segment.
+
+We address these two issues by using interactive basis functions [@Paez2019inducing] to induce non-orthogonal and non-linear decision boundaries in our models of market segments. Further, by moving the analysis of market segments to the first stage of the analysis, we obtain market segments with good homogeneity properties, and any spatial autocorrelation is dealt with by means of the spatial econometric model in the second step. The modelling strategy is described in more detail next.
+
+Modeling Strategy and Methods 
+===================
+
+## Modeling Strategy
+
+We propose a two-stage modelling strategy, as follows:
+
+1.	Estimate a first stage classification tree using the prices and the coordinates of the observations only [similar to trend surface analysis, see @Unwin1978introduction].
+  -	Map the regions $R_m$ that result: these are the $m=1,\cdots,M$ submarkets.
+  -	Overlay the observations on the tree-based regions and create a set of $m$ indicator variables for submarket membership: $I_m=I(y_i\in R_m)$; when the argument of the indicator function is true (i.e., when observation $y_i$ is in $R_m$) then $I_m=1$, otherwise $I_m=0$.
+2.	Estimate a second-stage hedonic price model that incorporates the indicator variables for submarkets obtained in first stage including spatial interaction effects and other relevant covariates.
+
+Note that the modeling strategy proposed here differs from the one proposed by @Fuss2016role in that the market areas are identified by these authors based on the residuals of a preliminary regression, whereas we identify them based on the prices directly. It is worth noting that these two strategies reflect different heuristics. Identification of market areas based on the prices implies that market areas are formed based on unitary properties before properties are assessed as bundles of attributes. Identification of market areas based on the residuals, on the other hand, implies that properties are first seen as bundles of attributes and that submarkets form based on other non-identified attributes.
+
+## Methods
+
+Two methodologies are combined in the modeling strategy. For first-stage we apply the well-known algorithm of classification trees with the objective of identify spatial submarkets. The algorithm is applied using the variation suggested by @Paez2019inducing to obtain non-orthogonal and non-linear boundaries via interactive basis functions. A short description of this method is found in the supplementary material. For the second-stage we apply spatial econometric methods to solve the presence of spatial autocorrelation in the residual of the classical hedonic models. The patial econometric models considered are also briefly described in the supplementary material. These methods are implemented in a number of open-source R packages. The **tree** R package [@tree] was used in first-stage and **spsur** [@lopez2020] and **spatialreg** [@bivand2013] in second-stage to estimate spatial regression models. Finally, with the objective of evaluate the forecasting accuracies of the different models and avoid overfitting the data set is split in training and test subsamples. The training subsample is used to obtain the model and the test subsample to evaluate the forecasting. The R package **spatialreg** is used to get the out-of-sample predictions is a spatial econometric framework.
+
+
+Data
+===================
+
+The empirical examples to follow correspond to large cities in Spain. The real estate market is one of the most important sectors of the Spanish economy, and the largest urban areas in Spain are important points of reference for the real estate market in the country. The three largest markets are Madrid (the national capital with 3.2 million inhabitants), Barcelona (1.6 million), and Valencia (0.8 million inhabitants). The focus of our application is on property prices in these cities. Micro-data from official sources are not available in Spain; instead, we draw our data from an online real estate database, Idealista.com (the leading real estate portal in Spain). 
+
+The data are documented and prepared for sharing publicly in the form of an open data product [@arribas2021open] under the structure of a R package free available from a repository\footnote{\url{https://paezha.github.io/idealista18/}} and a data paper describe the full data set. The database is for postings during 2018, and the analysis uses the last quarter of the year. We use the asking price as a proxy for the selling price; this is common practice in many real estate studies [e.g., @lopez2015; @chasco2018]. For the three data sets we consider the most frequent type of property in Spain, namely the flat (hereon termed "houses"); this excludes other types of properties, such as duplex, chalets, and attics, which conform separate real estate markets. 
+
+The data sets used in the analysis correspond to the last quarter of 2018, and include a total of $n=$ `r Madrid_Sale %>% filter(PERIOD == 201812) %>% nrow() %>% prettyNum(big.mark = ",")` for Madrid, $n=$ `r Barcelona_Sale %>% filter(PERIOD == 201812) %>% nrow() %>% prettyNum(big.mark = ",")` for Barcelona, and $n=$ `r Valencia_Sale %>% filter(PERIOD == 201812) %>% nrow() %>% prettyNum(big.mark = ",")` for Valencia. The distribution of prices displays a long tail in all three cities, and following conventional practice it is log-transformed. The coordinates are converted from latitude and longitude to northing and easting in meters, and then rescaled and centered using the corresponding city's Central Business District as a false origin. These transformations have no impact on the analysis, and rescaling and centering of the coordinates is necessary for the correct implementation of the interactive basis functions in decision trees [see @Paez2019inducing, pp. 188-189]. 
+
+For this research we select thirteen explanatory variables. Of these, ten attributes are data provided by Idealista.com and represent key structural attributes of the properties. These are whether the property is a studio (a small type of bachelor apartment), whether it is on the top floor of the building, and its built area, number of rooms, number of baths, and presence of a terrace. In addition, there are variables for elevator in the building, air conditioner, swimming pool, and parking spaces. We augment these attributes with locational variables derived from the coordinates of the property, including distance to nearest major transit station (metro), distance to the city center (central business district; CBD), and distance to major avenues. These locational attributes are frequently advertised by real estate agents and often capitalized in housing prices. Table \ref{tab:descriptives} gives the definitions of these variables and the descriptive statistics of the data.
+
+
+```{r, table-descriptive, echo = FALSE, message = FALSE}
+variables <- c(5,6,7,8,9,10,21,25,26,12,37,38,39)
+text_tbl <- data.frame(
+Variable = names(st_drop_geometry(Barcelona_Sale[variables])),
+Description = c("Home built area in sq.m",
+                           "Number of bedrooms",
+                           "Number of bathrooms",
+                           "=1 if has terrace, 0 otherwise",
+                           "=1 if has lift, 0 otherwise",
+                           "=1 if has air conditioner, 0 otherwise",
+                           "=1 if has swimming pool, 0 otherwise",
+                           "=1 if is studio apartment, 0 otherwise",
+                           "=1 is on the top floor, 0 otherwise",
+                           "=1 if has parking, 0 otherwise",
+                           "Distance to nearest subway station (km)",
+                           "Distance to city center (km)",
+                           "Distance to major avenue (km)"),
+# Barcelona
+mean = colMeans(st_drop_geometry(Barcelona_Sale[variables]), na.rm = TRUE),
+std = apply(st_drop_geometry(Barcelona_Sale[variables]),2,sd),
+# Madrid
+mean = colMeans(st_drop_geometry(Madrid_Sale[variables]), na.rm = TRUE),
+std = apply(st_drop_geometry(Madrid_Sale[variables]),2,sd),
+# Valencia
+mean=colMeans(st_drop_geometry(Valencia_Sale[variables]), na.rm = TRUE),
+std = apply(st_drop_geometry(Valencia_Sale[variables]),2,sd),
+check.names = FALSE)
+text_tbl[dim(text_tbl)[1],1]<-"DISTANCE_TO_(Avenue)"
+
+comment <- list(pos=list(0),command=NULL)
+comment$pos[[1]]<-c(nrow(text_tbl))
+comment$command <- "pepito"
+
+
+xtable::xtable(text_tbl, caption = "Sort description and descriptive statistics (Fourth Quarter of 2018)\\label{tab:descriptives}", add.to.row=comment) %>%
+xtable2kable(include.rownames = FALSE, booktabs=TRUE) %>%
+add_header_above(c(" " = 2," Barcelona" = 2,"Madrid" = 2,"Valencia"=2)) %>%
+kable_styling(full_width = F, font_size = 6) %>%
+column_spec(1, width = "12em", italic = FALSE) %>%
+column_spec(2, width = "16em") %>%
+column_spec(3, width = "1cm", latex_column_spec = "c") %>%
+column_spec(4, width = "1cm", latex_column_spec = "c") %>%
+column_spec(5, width = "1cm", latex_column_spec = "c") %>%
+column_spec(6, width = "0.5em", latex_column_spec = "c") %>%
+column_spec(7, width = "0.5em", latex_column_spec = "c") %>%
+column_spec(8, width = "0.5em", latex_column_spec = "c")
+```
+
+Empirical Examples
+===================
+
+## Experimental Design
+
+Each city's data set is split into a training sample and a testing sample using a 7:3 proportion. The training samples are used to estimate the models and the testing samples are used to assess the out-of-sample performance of the models. 
+
+We consider four models. First is a Base Model:
+```{=tex}
+\begin{equation}
+y_i = \ \sum_{j=1}^{k}{\beta_{j} x_{ij}} + \epsilon_i \ \ (i=1,...,n)
+\label{eq:base-model}
+\end{equation}
+```
+
+The second is a base model with market segments (Base Model + MS):
+```{=tex}
+\begin{equation}
+y_i = \sum_{m=2}^{M}{\gamma_{m} I(y_i\in R_m)} + \ \sum_{j=1}^{k}{\beta_{j} x_{ij}} + \epsilon_i \ \ (i=1,...,n)
+\label{eq:base-model-ms}
+\end{equation}
+```
+
+The third is a spatial lag model (Spatial Model):
+```{=tex}
+\begin{equation}
+y_i = \rho {1 \over n_i } \sum_{j=1}^{n_i}{Y_j} \ + \ \sum_{j=1}^{k}{\beta_{j} x_{ij}} + \epsilon_i \ \ (i=1,...,n)
+\label{eq:spatial-model}
+\end{equation}
+```
+
+And finally, the most general is a spatial lag model with market segments (Spatial Model + MS):
+```{=tex}
+\begin{equation}
+y_i = \rho {1 \over n_i } \sum_{j=1}^{n_i}{Y_j} \ + \ \sum_{m=2}^{M}{\gamma_{m} I(y_i\in R_m)} + \ \sum_{j=1}^{k}{\beta_{j} x_{ij}} + \epsilon_i \ \ (i=1,...,n)
+\label{eq:spatial-model-ms}
+\end{equation}
+```
+
+Please note that all models nest in the Spatial Model + MS depending on what restrictions are placed on the parameters. In the Base Model:
+```{=tex}
+\begin{equation}
+\rho = \gamma_{m} = 0\ \ (\forall m)
+\label{eq:restrictions-base}
+\end{equation}
+```
+
+In the Base Model + MS:
+```{=tex}
+\begin{equation}
+\rho = \ 0\ 
+\label{eq:restrictions-base}
+\end{equation}
+```
+
+And in the Spatial Model:
+```{=tex}
+\begin{equation}
+\gamma_{m} = 0\ \ (\forall m)
+\label{eq:restrictions-base}
+\end{equation}
+```
+
+The weights in the spatial weight matrices are calculated using the inverse of the distance between neighboring observations, so that closer observations receive a higher weight. To avoid increasing the density of the matrices [which has computational and also estimation effects], we combine this criterion with a cutoff of $k=6$ nearest neighbors. Given the distribution of distances in the sample, beyond these neighbors the inverse distance results in extremely small contributions to the autocorrelation effect. With respect to the interactive basis functions for the decision trees, we consider the following functions (see supplementary material) with $u$ and $v$ as the planar coordinates of the observations, easting and northing respectively:
+
+```{=tex}
+\begin{equation}
+\begin{array}{ccc}
+u_i + v_i \\ [5pt]
+u_i^2 + v_i^2 \\ [5pt]
+u_i \cdot v_i
+\end{array}
+\label{eq:ibf1}
+\end{equation}
+```
+
+We first look at the estimated models before discussing the in- and out-of-sample predictive performance of the models.
+
+## Modelling Results
+
+```{r change-config-barcelona, include=FALSE}
+config$City <- "Barcelona"
+config$Target_Variable <- "LOGPRICE"
+config$Features$Basic <- c("CONSTRUCTEDAREA",
+                           "ROOMNUMBER",
+                           "BATHNUMBER",
+                           "HASTERRACE",
+                           "HASLIFT",
+                           "HASAIRCONDITIONING",
+                           "HASSWIMMINGPOOL",
+                           "ISSTUDIO",
+                           "ISINTOPFLOOR",
+                           "HASPARKINGSPACE",
+                           #"DISTANCE_TO_METRO",
+                           "DISTANCE_TO_CITY_CENTER")#,
+                           #"DISTANCE_TO_DIAGONAL")
+config$Features$Surface <- c("X",
+                             "Y",
+                             "X2",
+                             "Y2",
+                             "X_x_Y")
+
+#Designate dataset to use and filter by period as desired
+assets.sf <- Barcelona_Sale %>%
+  filter(PERIOD == 201812)
+
+#Removes duplicated coordinates
+assets.sf <- assets.sf %>% 
+  distinct(LATITUDE, 
+           LONGITUDE, 
+           .keep_all = TRUE)
+
+neighborhoods_polygons <- Barcelona_Polygons
+
+pois.df.list <- Barcelona_POIS
+```
+
+```{r prepare-barcelona, ref.label = 'base-code-preparation', include=FALSE}
+
+```
+
+```{r spatial-weights-barcelona, ref.label = 'base-code-spatial-weights', include=FALSE, cache=TRUE}
+# Barcelona spatial weights: this is the most time consuming part of the analysis, using cache
+```
+
+```{r analysis-barcelona, cache = TRUE, ref.label = 'base-code-analysis', include=FALSE}
+
+```
+
+```{r models-barcelona, echo=FALSE}
+barcelona_grid1 <- grid1
+barcelona_base.model <- base.model
+barcelona_linear.market.segments <- linear.market.segments
+barcelona_spatial.model <- spatial.model
+barcelona_spatial.market.segments <- spatial.market.segments
+```
+
+```{r model-diagnostics-barcelona, echo = FALSE, warning=FALSE}
+# Number of observations
+barcelona_n <- base.model$residuals %>% 
+  length()
+
+# R2 and adjusted R2
+barcelona_base.model_diagnostics <- barcelona_base.model %>% 
+  summary()
+barcelona_base.model_r2 <- barcelona_base.model_diagnostics$r.squared
+barcelona_base.model_adjr2 <- barcelona_base.model_diagnostics$adj.r.squared
+
+barcelona_linear.market.segments_diagnostics <- barcelona_linear.market.segments %>% 
+  summary()
+barcelona_linear.market.segments_r2 <- barcelona_linear.market.segments_diagnostics$r.squared
+barcelona_linear.market.segments_adjr2 <- barcelona_linear.market.segments_diagnostics$adj.r.squared
+
+# Log-likelihood
+barcelona_base.model_logLik <- barcelona_base.model %>%
+  logLik() %>% 
+  as.numeric()
+barcelona_linear.market.segments_logLik <- barcelona_linear.market.segments %>%
+  logLik() %>% 
+  as.numeric()
+barcelona_spatial.model_logLik <- barcelona_spatial.model %>%
+  logLik() %>% 
+  as.numeric()
+barcelona_spatial.market.segments_logLik <- barcelona_spatial.market.segments %>%
+  logLik() %>% 
+  as.numeric()
+
+# Likelihood ratio tests
+barcelona_lrt_1_4 = lrtest(barcelona_base.model, barcelona_spatial.market.segments)
+barcelona_lrt_2_4 = lrtest(barcelona_linear.market.segments, barcelona_spatial.market.segments)
+barcelona_lrt_3_4 = lrtest(barcelona_spatial.model, barcelona_spatial.market.segments)
+```
+
+```{r summary-barcelona, echo=FALSE}
+# Add some useful information to the table
+barcelona_performance.df <- performance.metrics.df %>%
+                          dplyr::mutate(City = config$City,
+                                 Training_Date = date()) %>%
+                         dplyr::select(City, Training_Date, everything())
+```
+
+```{r change-config-madrid, echo=FALSE}
+config$City <- "Madrid"
+config$Target_Variable <- "LOGPRICE"
+config$Features$Basic <- c("CONSTRUCTEDAREA",
+                           "ROOMNUMBER",
+                           "BATHNUMBER",
+                           "HASTERRACE",
+                           "HASLIFT",
+                           "HASAIRCONDITIONING",
+                           "HASSWIMMINGPOOL",
+                           "ISSTUDIO",
+                           "ISINTOPFLOOR",
+                           "HASPARKINGSPACE",
+                           "DISTANCE_TO_METRO",
+                           "DISTANCE_TO_CITY_CENTER",
+                           "DISTANCE_TO_CASTELLANA")
+config$Features$Surface <- c("X",
+                             "Y",
+                             "X2",
+                             "Y2",
+                             "X_x_Y")
+
+#Designate dataset to use and filter by period as desired
+assets.sf <- Madrid_Sale %>%
+  filter(PERIOD == 201812)
+
+#Removes duplicated coordinates
+assets.sf <- assets.sf %>% 
+  distinct(LATITUDE, 
+           LONGITUDE, 
+           .keep_all = TRUE)
+
+neighborhoods_polygons <- Madrid_Polygons
+
+pois.df.list <- Madrid_POIS
+```
+
+```{r prepare-madrid, ref.label = 'base-code-preparation', include=FALSE}
+# Madrid data preparation
+```
+
+```{r spatial-weights-madrid, ref.label = 'base-code-spatial-weights', include=FALSE, cache=TRUE}
+# Madrid spatial weights: this is the most time consuming part of the analysis, using cache
+```
+
+```{r analysis-madrid, cache = TRUE, ref.label = 'base-code-analysis', include=FALSE}
+
+```
+
+```{r models-madrid, echo=FALSE}
+madrid_grid1 <- grid1
+madrid_base.model <- base.model
+madrid_linear.market.segments <- linear.market.segments
+madrid_spatial.model <- spatial.model
+madrid_spatial.market.segments <- spatial.market.segments
+```
+
+```{r model-diagnostics-madrid, echo = FALSE, warning=FALSE}
+# Number of observations
+madrid_n <- madrid_base.model$residuals %>% 
+  length()
+
+# R2 and adjusted R2
+madrid_base.model_diagnostics <- madrid_base.model %>% 
+  summary()
+madrid_base.model_r2 <- madrid_base.model_diagnostics$r.squared
+madrid_base.model_adjr2 <- madrid_base.model_diagnostics$adj.r.squared
+
+madrid_linear.market.segments_diagnostics <- madrid_linear.market.segments %>% 
+  summary()
+madrid_linear.market.segments_r2 <- madrid_linear.market.segments_diagnostics$r.squared
+madrid_linear.market.segments_adjr2 <- madrid_linear.market.segments_diagnostics$adj.r.squared
+
+# Log-likelihood
+madrid_base.model_logLik <- madrid_base.model %>%
+  logLik() %>% 
+  as.numeric()
+madrid_linear.market.segments_logLik <- madrid_linear.market.segments %>%
+  logLik() %>% 
+  as.numeric()
+madrid_spatial.model_logLik <- madrid_spatial.model %>%
+  logLik() %>% 
+  as.numeric()
+madrid_spatial.market.segments_logLik <- madrid_spatial.market.segments %>%
+  logLik() %>% 
+  as.numeric()
+
+# Likelihood ratio tests
+madrid_lrt_1_4 = lrtest(madrid_base.model, madrid_spatial.market.segments)
+madrid_lrt_2_4 = lrtest(madrid_linear.market.segments, madrid_spatial.market.segments)
+madrid_lrt_3_4 = lrtest(madrid_spatial.model, madrid_spatial.market.segments)
+```
+
+```{r summary-madrid, echo=FALSE}
+# Add some useful information to the table
+madrid_performance.df <- performance.metrics.df %>%
+                          dplyr::mutate(City = config$City,
+                                 Training_Date = date()) %>%
+                         dplyr::select(City, Training_Date, everything())
+```
+
+```{r change-config-valencia, echo=FALSE}
+config$City <- "Valencia"
+config$Target_Variable <- "LOGPRICE"
+config$Features$Basic <- c("CONSTRUCTEDAREA",
+                           "ROOMNUMBER",
+                           "BATHNUMBER",
+                           "HASTERRACE",
+                           "HASLIFT",
+                           "HASAIRCONDITIONING",
+                           "HASSWIMMINGPOOL",
+                           "ISSTUDIO",
+                           "ISINTOPFLOOR",
+                           "HASPARKINGSPACE",
+                           "DISTANCE_TO_CITY_CENTER",
+                           "DISTANCE_TO_METRO",
+                           "DISTANCE_TO_BLASCO")
+config$Features$Surface <- c("X",
+                             "Y",
+                             "X2",
+                             "Y2",
+                             "X_x_Y")
+
+#Designate dataset to use and filter by period as desired
+assets.sf <- Valencia_Sale %>%
+  filter(PERIOD == 201812)
+
+#Removes duplicated coordinates
+assets.sf <- assets.sf %>% 
+  distinct(LATITUDE, 
+           LONGITUDE, 
+           .keep_all = TRUE)
+
+#Neighborhood polygons
+neighborhoods_polygons <- Valencia_Polygons
+
+#Points of interest
+pois.df.list <- Valencia_POIS
+```
+
+```{r prepare-valencia, ref.label = 'base-code-preparation', include=FALSE}
+
+```
+
+```{r spatial-weights-valencia, ref.label = 'base-code-spatial-weights', include=FALSE, cache=TRUE}
+# Valencia spatial weights: this is the most time consuming part of the analysis, using cache
+```
+
+```{r analysis-valencia, cache = TRUE, ref.label = 'base-code-analysis', include=FALSE}
+
+```
+
+```{r models-valencia, echo=FALSE}
+valencia_grid1 <- grid1
+valencia_base.model <- base.model
+valencia_linear.market.segments <- linear.market.segments
+valencia_spatial.model <- spatial.model
+valencia_spatial.market.segments <- spatial.market.segments
+```
+
+```{r model-diagnostics-valencia, echo = FALSE, warning=FALSE}
+# Number of observations
+valencia_n <- valencia_base.model$residuals %>% 
+  length()
+
+# R2 and adjusted R2
+valencia_base.model_diagnostics <- valencia_base.model %>% 
+  summary()
+valencia_base.model_r2 <- valencia_base.model_diagnostics$r.squared
+valencia_base.model_adjr2 <- valencia_base.model_diagnostics$adj.r.squared
+
+valencia_linear.market.segments_diagnostics <- valencia_linear.market.segments %>% 
+  summary()
+valencia_linear.market.segments_r2 <- valencia_linear.market.segments_diagnostics$r.squared
+valencia_linear.market.segments_adjr2 <- valencia_linear.market.segments_diagnostics$adj.r.squared
+
+# Log-likelihood
+valencia_base.model_logLik <- valencia_base.model %>%
+  logLik() %>% 
+  as.numeric()
+valencia_linear.market.segments_logLik <- valencia_linear.market.segments %>%
+  logLik() %>% 
+  as.numeric()
+valencia_spatial.model_logLik <- valencia_spatial.model %>%
+  logLik() %>% 
+  as.numeric()
+valencia_spatial.market.segments_logLik <- valencia_spatial.market.segments %>%
+  logLik() %>% 
+  as.numeric()
+
+# Likelihood ratio tests
+valencia_lrt_1_4 = lrtest(valencia_base.model, valencia_spatial.market.segments)
+valencia_lrt_2_4 = lrtest(valencia_linear.market.segments, valencia_spatial.market.segments)
+valencia_lrt_3_4 = lrtest(valencia_spatial.model, valencia_spatial.market.segments)
+```
+
+```{r summary-valencia, echo=FALSE}
+# Add some useful information to the table
+valencia_performance.df <- performance.metrics.df %>%
+                          dplyr::mutate(City = config$City,
+                                 Training_Date = date()) %>%
+                         dplyr::select(City, Training_Date, everything())
+```
+
+```{r market-sizes, echo=FALSE}
+# Calculate the size of the minimum market segment
+min_segment <- rbind(data.frame(size = barcelona_linear.market.segments$model$market_segment %>% 
+                   table() %>% 
+                   sort() %>% 
+                   min(), 
+                 city = "Barcelona"), 
+      data.frame(size = madrid_linear.market.segments$model$market_segment %>% 
+                   table() %>% 
+                   sort() %>% 
+                   min(), 
+                 city = "Madrid"), 
+      data.frame(size = valencia_linear.market.segments$model$market_segment %>% 
+                   table() %>% 
+                   sort() %>% 
+                   min(), 
+                 city = "Valencia"))
+
+# Calculate the size of the maximum market segment
+max_segment <- rbind(data.frame(size = barcelona_linear.market.segments$model$market_segment %>% 
+                   table() %>% 
+                   sort() %>% 
+                   max(), 
+                 city = "Barcelona"), 
+      data.frame(size = madrid_linear.market.segments$model$market_segment %>% 
+                   table() %>% 
+                   sort() %>% 
+                   max(), 
+                 city = "Madrid"), 
+      data.frame(size = valencia_linear.market.segments$model$market_segment %>% 
+                   table() %>% 
+                   sort() %>% 
+                   max(), 
+                 city = "Valencia"))
+```
+
+The first model in each of Tables \ref{tab:model-results-barcelona}, \ref{tab:model-results-madrid}, and \ref{tab:model-results-valencia} is the Base Model. The fit of these models is reasonably high: the adjusted coefficients of determination are $R^2=$ `r round(barcelona_base.model_r2, 3)`, $R^2=$ `r round(madrid_base.model_r2, 3)`, and $R^2=$ `r round(valencia_base.model_r2, 3)` for Barcelona, Madrid, and Valencia, respectively. These models are relatively naive in that they disregard both the possibility of spatial autocorrelation and spatial heterogeneity (in the form of spatial market sub-segments). They do provide a useful benchmark to compare the proposed modelling strategy.
+
+The first stage of the modelling strategy is to train a decision tree on the property values using only the coordinates of the observations. The spatial market sub-segments derived from the decision trees are shown in Figure \ref{fig:all-market-segments}. It can be seen there that the algorithm detects seven market sub-segments in Barcelona, nine market sub-segments in Madrid, and eight in Valencia. These submarkets are compact, mutually exclusive, and collectively exhaustive. The smallest market segment is found in `r min_segment %>% filter(size == min(min_segment$size)) %>% pull(city)` and has `r min_segment %>% filter(size == min(min_segment$size)) %>% pull(size) %>% prettyNum(big.mark = ",")` recorded transactions; the largest market segment, in contrast, has `r max_segment %>% filter(size == max(max_segment$size)) %>% pull(size) %>% prettyNum(big.mark = ",")` recorded transactions and is found in `r max_segment %>% filter(size == max(max_segment$size)) %>% pull(city)`. The maps in the figure show how the use of interactive basis functions leads to non-orthogonal/non-linear boundaries for the sub-markets. In the case of Barcelona, there are some distinctive diagonal shapes reminiscent of the street pattern in the city. In Madrid there is a clear distinction given by the M-30 orbital that surrounds the central almond of the city; in addition, there is Paseo de la Castellana, a major north-south avenue that crosses the city. This avenue divides two zones in the north that tend to include more expensive real estate, whereas the south tends to be lower income and less expensive. In Valencia, the sub-markets identify several zones in the historical center of the city, and then larger regional patterns depending on proximity to the waterfront to the west of the city.
+
+```{r, echo = FALSE, message=FALSE, fig.width=5, fig.cap="\\label{fig:all-market-segments}Spatial market segments according to Stage 1 classification tree. Barcelona (upper-left), Madrid (upper-right), and Valencia (botton-center)"}
+library("gridExtra") # Miscellaneous Functions for "Grid" Graphics
+ms_barcelona <- ggplot(barcelona_grid1) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Barcelona_Polygons,
+          color = "lightgray",size=.2,
+          fill = NA) +
+  scale_color_viridis_d(name = "Market Segment") +
+  theme_bw(base_size = 5) +
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        axis.text.x = element_text(size=2),
+        axis.text.y = element_text(size=2,angle=90),
+        plot.margin=unit(c(0.1,0.1,0.1,0.1),"cm"),
+        legend.key.size = unit(0.2, 'cm'))
+
+ms_madrid <- ggplot(madrid_grid1) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Madrid_Polygons,
+          color = "lightgray",size=.2,
+          fill = NA) +
+  scale_color_viridis_d(name = "Market Segment") +
+  theme_bw(base_size = 5) +
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        axis.text.x = element_text(size=2),
+        axis.text.y = element_text(size=2,angle=90),
+        plot.margin=unit(c(0.1,0.1,0.1,0.1),"cm"),
+        legend.key.size = unit(0.2, 'cm'))
+
+ms_valencia <- ggplot(valencia_grid1) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Valencia_Polygons,
+          color = "lightgray",size=.2,
+          fill = NA) +
+  scale_color_viridis_d(name = "Market Segment") +
+  theme_bw(base_size = 5) +
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        axis.text.x = element_text(size=2),
+        axis.text.y = element_text(size=2,angle=90),
+        plot.margin=unit(c(0.1,0.1,0.1,0.1),"cm"),
+        legend.key.size = unit(0.2, 'cm')) +
+        guides(color = guide_legend(nrow = 2, byrow = TRUE))
+grid.arrange(ms_barcelona, ms_madrid, ms_valencia, layout_matrix = rbind(c(1,1,2,2),c(NA,3,3,NA)), ncol=4, nrow = 2)
+```
+
+The spatial market sub-segments are coded as dummy variables in the data sets before re-estimating the Base Model with market segments (Base Model + MS). The second model reported in Tables \ref{tab:model-results-barcelona}, \ref{tab:model-results-madrid}, and \ref{tab:model-results-valencia} shows that the market segments tend to be highly significant, and also improve the fit of the model. In the case of Barcelona, the adjusted coefficient of determination changes to $R^2=$ `r round(barcelona_linear.market.segments_adjr2, 3)`, for a modest increase of `r round((barcelona_linear.market.segments_adjr2 - barcelona_base.model_adjr2)/barcelona_base.model_adjr2 * 100, 2)`\%. The introduction of the market segments into the Base Model for Madrid results in an adjusted coefficient of determination of $R^2=$ `r round(madrid_linear.market.segments_adjr2, 3)`, which represents a change of `r round((madrid_linear.market.segments_adjr2 - madrid_base.model_adjr2)/madrid_base.model_adjr2 * 100, 2)`\% relative to the adjusted coefficient of determination of the Base Model. In Valencia, the Base Model with market segments has an adjusted coefficient of determination of $R^2=$ `r round(valencia_linear.market.segments_adjr2, 3)`, for an increase with respect to the Base Model of `r round((valencia_linear.market.segments_adjr2 - valencia_base.model_adjr2)/valencia_base.model_adjr2 * 100, 2)`\%.
+
+It is well-known that spatial heterogeneity and association can co-exist [e.g., @Bourassa2007spatial; @Paez2001spatial]. Sub-market identification can assist with spatial heterogeneity, but a process of spatial association could result from the common heuristic of comparative sales used by real estate agents. This process is appropriately represented by a spatial lag model. The third model reported in Tables \ref{tab:model-results-barcelona}, \ref{tab:model-results-madrid}, and \ref{tab:model-results-valencia} is the Spatial Model, that is the Base Model with a spatial lag (i.e., Equation \ref{eq:spatial-model}). Spatial lag models, being non-linear, lack the coefficient of determination of linear regression. Instead, their goodness of fit is evaluated using likelihood measures. It can be seen that there is a substantial improvement in this regard in all three cities. <!-- ^[Note that the log-likelihood of spatial models can be positive.] --> The spatial lag parameter $\rho$ represents the proportion of the mean of the neighboring prices that is reflected in the price of the property at $i$. In Barcelona, this parameter suggests that approximately `r (barcelona_spatial.model$rho * 100) %>% round(2)`\% of the mean of the price of the $k=6$ nearest neighbors is reflected in the price at $i$. This "comparative sales" effect is markedly stronger in Madrid, where it amounts to `r (madrid_spatial.model$rho * 100) %>% round(2)`\% of the mean price of the neighbors. In Valencia, this effect is `r (valencia_spatial.model$rho * 100) %>% round(2)`\%. The spatial lag parameter is significant in all three cases, and the results suggest that comparisons with other properties play a larger role in the determination of prices in Madrid. 
+
+The last model that we consider for these case studies is a spatial lag model with market segments. This is the most general of the four models, and we see that the combination of market segments and a spatial lag variable gives the best fit in terms of the log-likelihood, and also reduces the size of the spatial lag coefficient, shifting some of the spatial effect from spatial autocorrelation to spatial heterogeneity. 
+
+At this point, it is important to note that the coefficients of models with spatial lags cannot be interpreted as marginal effects due to the ripple effects of lagging variables (i.e., the multiplier effect of the lag). Instead, the direct, indirect, and total impacts need to be considered. The impacts of our best models (spatial models with market segments) are presented in Tables \ref{tab:model-impacts-barcelona}, \ref{tab:model-impacts-madrid}, and \ref{tab:model-impacts-valencia}.
+
+<!--
+Spatial autocorrelation and spatial heterogeneity can interact in complex ways, and while these two effects cannot be distinguished a priori, the improved fit suggests that spatial heterogeneity (i.e., the spatial market segments) are a better interpretation of the data than spatial autocorrelation alone. There is an additional way in which the two effects interact: spatial heterogeneity reduces the strength of spatial autocorrelation, but in turn spatial autocorrelation can influence the effect of the spatial market segments through the multiplier effect. As seen in Tables \ref{tab:model-impacts-barcelona}, \ref{tab:model-impacts-madrid}, and \ref{tab:model-impacts-valencia}, the total effect of each market segment is greater than the direct effect alone.
+-->
+
+```{r table-models-barcelona, echo=FALSE}
+
+broom::tidy(barcelona_base.model) %>% 
+  full_join(broom::tidy(barcelona_linear.market.segments), 
+            by = "term")  %>%
+  full_join(broom::tidy(barcelona_spatial.model), 
+            by = "term")  %>%
+  full_join(broom::tidy(barcelona_spatial.market.segments), 
+            by = "term")  %>%
+  dplyr::select(term, estimate.x, p.value.x, estimate.y, p.value.y, estimate.x.x, p.value.x.x, estimate.y.y, p.value.y.y) %>%
+  mutate(across(.cols = starts_with("p.value"), .fns = ~ifelse(.x < 0.001, 0, .x)),
+         across(.cols = -term, .fns =  ~round(.x, 4)),
+         across(.cols = -term, .fns = ~ifelse(is.na(.x), "-", .x)),
+         across(.cols = starts_with("p.value"), .fns = ~ifelse(.x == 0, " 0.001", .x))) %>%
+    rbind(c("R-squared", 
+          "", barcelona_base.model_r2 %>% round(2),
+          "", barcelona_linear.market.segments_r2 %>% round(2),
+          "", "-",
+          "", "-"),
+        c("adj-R-squared:", 
+          "", barcelona_base.model_adjr2 %>% round(2),
+          "", barcelona_linear.market.segments_adjr2 %>% round(2),
+          "", "-",
+          "", "-"),
+        c("log-likelihood:", 
+          "", barcelona_base.model_logLik %>% round(2),
+          "", barcelona_linear.market.segments_logLik %>% round(2),
+          "", barcelona_spatial.model_logLik %>% round(2),
+          "", barcelona_spatial.market.segments_logLik %>% round(2))) %>%
+  kable("latex",
+        booktabs = TRUE,
+        digits = 3,
+        caption = "\\label{tab:model-results-barcelona}Models Barcelona (Dependent Variable is log of Price)",
+        align = c("lcccccccc"),
+        col.names = c("Variable", "Estimate", "p-val", "Estimate", "p-val", "Estimate", "p-val", "Estimate", "p-val"),
+        escape = TRUE) %>%
+  kable_styling(latex_options = c("scale_down")) %>%
+  kableExtra::group_rows(group_label = "Property attributes", start_row = 1, end_row = 12) %>%
+  kableExtra::group_rows(group_label = "Market segments", start_row = 13, end_row = 18) %>%
+  kableExtra::group_rows(group_label = "Spatial lag parameter", start_row = 19, end_row = 19) %>%
+  kableExtra::group_rows(group_label = "Model diagnostics", start_row = 20, end_row = 22) %>%
+  add_header_above(c(" ", "Base Model" = 2,
+                     "Base Model + MS" = 2, 
+                    "Spatial Model" = 2, 
+                     "Spatial Model + MS" = 2))
+```
+
+```{r table-models-madrid, echo=FALSE}
+broom::tidy(madrid_base.model) %>% 
+  full_join(broom::tidy(madrid_linear.market.segments), 
+            by = "term")  %>%
+  full_join(broom::tidy(madrid_spatial.model), 
+            by = "term")  %>%
+  full_join(broom::tidy(madrid_spatial.market.segments), 
+            by = "term")  %>%
+  dplyr::select(term, estimate.x, p.value.x, estimate.y, p.value.y, estimate.x.x, p.value.x.x, estimate.y.y, p.value.y.y) %>%
+  mutate(across(.cols = starts_with("p.value"), .fns = ~ifelse(.x < 0.001, 0, .x)),
+         across(.cols = -term, .fns =  ~round(.x, 4)),
+         across(.cols = -term, .fns = ~ifelse(is.na(.x), "-", .x)),
+         across(.cols = starts_with("p.value"), .fns = ~ifelse(.x == 0, "0.001", .x))) %>%
+    rbind(c("R-squared", 
+          "", madrid_base.model_r2 %>% round(2),
+          "", madrid_linear.market.segments_r2 %>% round(2),
+          "", "-",
+          "", "-"),
+        c("adj-R-squared:", 
+          "", madrid_base.model_adjr2 %>% round(2),
+          "", madrid_linear.market.segments_adjr2 %>% round(2),
+          "", "-",
+          "", "-"),
+        c("log-likelihood:", 
+          "", madrid_base.model_logLik %>% round(2),
+          "", madrid_linear.market.segments_logLik %>% round(2),
+          "", madrid_spatial.model_logLik %>% round(2),
+          "", madrid_spatial.market.segments_logLik %>% round(2))) %>%
+  kable("latex",
+        booktabs = TRUE,
+        digits = 3,
+        caption = "\\label{tab:model-results-madrid}Models Madrid (Dependent Variable is log of Price)",
+        align = c("lcccccccc"),
+        col.names = c("Variable", "Estimate", "p-val", "Estimate", "p-val", "Estimate", "p-val", "Estimate", "p-val"),
+        escape = TRUE) %>%
+  kable_styling(latex_options = c("scale_down")) %>%
+  kableExtra::group_rows(group_label = "Property attributes", start_row = 1, end_row = 14) %>%
+  kableExtra::group_rows(group_label = "Market segments", start_row = 15, end_row = 22) %>%
+  kableExtra::group_rows(group_label = "Spatial lag parameter", start_row = 23, end_row = 23) %>%
+  kableExtra::group_rows(group_label = "Model diagnostics", start_row = 24, end_row = 26) %>%
+  add_header_above(c(" ", "Base Model" = 2,
+                     "Base Model + MS" = 2, 
+                    "Spatial Model" = 2, 
+                     "Spatial Model + MS" = 2)) %>%
+  footnote(general = "0.001 in the p-values represents any value less than 0.001")
+```
+
+```{r table-models-valencia, echo=FALSE}
+broom::tidy(valencia_base.model) %>% 
+  full_join(broom::tidy(valencia_linear.market.segments), 
+            by = "term")  %>%
+  full_join(broom::tidy(valencia_spatial.model), 
+            by = "term")  %>%
+  full_join(broom::tidy(valencia_spatial.market.segments), 
+            by = "term")  %>%
+  select(term, starts_with("estimate"), starts_with("p")) %>%
+  dplyr::select(term, estimate.x, p.value.x, estimate.y, p.value.y, estimate.x.x, p.value.x.x, estimate.y.y, p.value.y.y) %>%
+  mutate(across(.cols = starts_with("p.value"), .fns = ~ifelse(.x < 0.001, 0, .x)),
+         across(.cols = -term, .fns =  ~round(.x, 4)),
+         across(.cols = -term, .fns = ~ifelse(is.na(.x), "-", .x)),
+         across(.cols = starts_with("p.value"), .fns = ~ifelse(.x == 0, "0.001", .x))) %>%
+  rbind(c("R-squared", 
+          "", valencia_base.model_r2 %>% round(2),
+          "", valencia_linear.market.segments_r2 %>% round(2),
+          "", "-",
+          "", "-"),
+        c("adj-R-squared:", 
+          "", valencia_base.model_adjr2 %>% round(2),
+          "", valencia_linear.market.segments_adjr2 %>% round(2),
+          "", "-",
+          "", "-"),
+        c("log-likelihood:", 
+          "", valencia_base.model_logLik %>% round(2),
+          "", valencia_linear.market.segments_logLik %>% round(2),
+          "", valencia_spatial.model_logLik %>% round(2),
+          "", valencia_spatial.market.segments_logLik %>% round(2))) %>%
+  kable("latex",
+        booktabs = TRUE,
+        digits = 3,
+        caption = "\\label{tab:model-results-valencia}Models Valencia (Dependent Variable is log of Price)",
+        align = c("lcccccccc"),
+        col.names = c("Variable", "Estimate", "p-val", "Estimate", "p-val", "Estimate", "p-val", "Estimate", "p-val"),
+        escape = TRUE) %>%
+  kable_styling(latex_options = c("scale_down")) %>%
+  kableExtra::group_rows(group_label = "Property attributes", start_row = 1, end_row = 14) %>%
+  kableExtra::group_rows(group_label = "Market segments", start_row = 15, end_row = 21) %>%
+  kableExtra::group_rows(group_label = "Spatial lag parameter", start_row = 22, end_row = 22) %>%
+  kableExtra::group_rows(group_label = "Model diagnostics", start_row = 23, end_row = 25) %>%
+  add_header_above(c(" ", "Base Model" = 2,
+                     "Base Model + MS" = 2, 
+                    "Spatial Model" = 2, 
+                     "Spatial Model + MS" = 2)) %>%
+  footnote(general = "0.001 in the p-values represents any value less than 0.001")
+```
+
+```{r barcelona-impacts, echo=FALSE}
+barcelona_spatial.market.segments.impacts <- spatialreg::impacts(barcelona_spatial.market.segments, 
+                                                                 tr = tr.list.train.W6, 
+                                                                 R = 1000)
+
+barcelona.impacts.summary <- summary(barcelona_spatial.market.segments.impacts)
+
+# Create table
+# Retrieve variable names in same order as table with model results
+broom::tidy(barcelona_base.model) %>% 
+  full_join(broom::tidy(barcelona_linear.market.segments), 
+            by = "term") %>%
+  select(term) %>%
+  # Join to impacts
+  full_join(data.frame(term = attr(barcelona_spatial.market.segments.impacts, "bnames"),
+                       direct = barcelona_spatial.market.segments.impacts$res$direct,
+                       # Calculate p-value of direct impacts
+                       direct_p = dnorm(abs(barcelona.impacts.summary$direct_sum$statistics[,1]/barcelona.impacts.summary$direct_sum$statistics[,2])),
+                       indirect = barcelona_spatial.market.segments.impacts$res$indirect,
+                       # Calculate p-value of indirect impacts
+                       indirect_p = dnorm(abs(barcelona.impacts.summary$indirect_sum$statistics[,1]/barcelona.impacts.summary$indirect_sum$statistics[,2])),
+                       total = barcelona_spatial.market.segments.impacts$res$total,
+                       # Calculate p-value of total impacts
+                       total_p = dnorm(abs(barcelona.impacts.summary$total_sum$statistics[,1]/barcelona.impacts.summary$total_sum$statistics[,2]))),
+            by = "term") %>%
+  # Drop intercept
+  drop_na() %>%
+  # Format p-values
+  mutate(direct_p = ifelse(direct_p < 0.001, 
+                           "0.001", 
+                           round(direct_p, 4)),
+         indirect_p = ifelse(indirect_p < 0.001, 
+                           "0.001", 
+                           round(indirect_p, 4)),
+         total_p = ifelse(total_p < 0.001, 
+                           "0.001", 
+                           round(total_p, 4)))%>%
+  # Tabulate
+  kable("latex",
+        booktabs = TRUE,
+        digits = 3,
+        caption = "\\label{tab:model-impacts-barcelona}Impacts Spatial Model + MS Barcelona (Dependent Variable is log of Price)",
+        align = c("lcccccccc"),
+        col.names = c("Variable", "Direct", "p-val", "Indirect", "p-val", "Total", "p-val"),
+        escape = TRUE) %>%
+  kable_styling(latex_options = c("scale_down")) %>%
+  kableExtra::group_rows(group_label = "Property attributes", start_row = 1, end_row = 11) %>%
+  kableExtra::group_rows(group_label = "Market segments", start_row = 12, end_row = 17) %>%
+  footnote(general = "0.001 in the p-values represents any value less than 0.001")
+```
+
+
+```{r madrid.impacts, echo=FALSE}
+madrid_spatial.market.segments.impacts <- spatialreg::impacts(madrid_spatial.market.segments, 
+                                                                 tr = tr.list.train.W6, 
+                                                                 R = 1000)
+
+madrid.impacts.summary <- summary(madrid_spatial.market.segments.impacts)
+
+# Create table
+# Retrieve variable names in same order as table with model results
+broom::tidy(madrid_base.model) %>% 
+  full_join(broom::tidy(madrid_linear.market.segments), 
+            by = "term") %>%
+  select(term) %>%
+  # Join to impacts
+  full_join(data.frame(term = attr(madrid_spatial.market.segments.impacts, "bnames"),
+                       direct = madrid_spatial.market.segments.impacts$res$direct,
+                       # Calculate p-value of direct impacts
+                       direct_p = dnorm(abs(madrid.impacts.summary$direct_sum$statistics[,1]/madrid.impacts.summary$direct_sum$statistics[,2])),
+                       indirect = madrid_spatial.market.segments.impacts$res$indirect,
+                       # Calculate p-value of indirect impacts
+                       indirect_p = dnorm(abs(madrid.impacts.summary$indirect_sum$statistics[,1]/madrid.impacts.summary$indirect_sum$statistics[,2])),
+                       total = madrid_spatial.market.segments.impacts$res$total,
+                       # Calculate p-value of total impacts
+                       total_p = dnorm(abs(madrid.impacts.summary$total_sum$statistics[,1]/madrid.impacts.summary$total_sum$statistics[,2]))),
+            by = "term") %>%
+  # Drop intercept
+  drop_na() %>%
+  # Format p-values
+  mutate(direct_p = ifelse(direct_p < 0.001, 
+                           "0.001", 
+                           round(direct_p, 3)),
+         indirect_p = ifelse(indirect_p < 0.001, 
+                           "0.001", 
+                           round(indirect_p, 3)),
+         total_p = ifelse(total_p < 0.001, 
+                           "0.001", 
+                           round(total_p, 3)))%>%
+  # Tabulate
+  kable("latex",
+        booktabs = TRUE,
+        digits = 3,
+        caption = "\\label{tab:model-impacts-madrid}Impacts Spatial Model + MS Madrid (Dependent Variable is log of Price)",
+        align = c("lcccccccc"),
+        col.names = c("Variable", "Direct", "p-val", "Indirect", "p-val", "Total", "p-val"),
+        escape = TRUE) %>%
+  kable_styling(latex_options = c("scale_down")) %>%
+  kableExtra::group_rows(group_label = "Property attributes", start_row = 1, end_row = 13) %>%
+  kableExtra::group_rows(group_label = "Market segments", start_row = 14, end_row = 21) %>%
+  footnote(general = "0.001 in the p-values represents any value less than 0.001")
+```
+
+```{r valencia.impacts, echo=FALSE}
+valencia_spatial.market.segments.impacts <- spatialreg::impacts(valencia_spatial.market.segments, 
+                                                              tr = tr.list.train.W6, 
+                                                              R = 1000)
+
+valencia.impacts.summary <- summary(valencia_spatial.market.segments.impacts)
+
+# Create table
+# Retrieve variable names in same order as table with model results
+broom::tidy(valencia_base.model) %>% 
+  full_join(broom::tidy(valencia_linear.market.segments), 
+            by = "term") %>%
+  select(term) %>%
+  # Join to impacts
+  full_join(data.frame(term = attr(valencia_spatial.market.segments.impacts, "bnames"),
+                       direct = valencia_spatial.market.segments.impacts$res$direct,
+                       # Calculate p-value of direct impacts
+                       direct_p = dnorm(abs(valencia.impacts.summary$direct_sum$statistics[,1]/valencia.impacts.summary$direct_sum$statistics[,2])),
+                       indirect = valencia_spatial.market.segments.impacts$res$indirect,
+                       # Calculate p-value of indirect impacts
+                       indirect_p = dnorm(abs(valencia.impacts.summary$indirect_sum$statistics[,1]/valencia.impacts.summary$indirect_sum$statistics[,2])),
+                       total = valencia_spatial.market.segments.impacts$res$total,
+                       # Calculate p-value of total impacts
+                       total_p = dnorm(abs(valencia.impacts.summary$total_sum$statistics[,1]/valencia.impacts.summary$total_sum$statistics[,2]))),
+            by = "term") %>%
+  # Drop intercept
+  drop_na() %>%
+  # Format p-values
+  mutate(direct_p = ifelse(direct_p < 0.001, 
+                           "0.001", 
+                           round(direct_p, 3)),
+         indirect_p = ifelse(indirect_p < 0.001, 
+                             "0.001", 
+                             round(indirect_p, 3)),
+         total_p = ifelse(total_p < 0.001, 
+                          "0.001", 
+                          round(total_p, 3)))%>%
+  # Tabulate
+  kable("latex",
+        booktabs = TRUE,
+        digits = 3,
+        caption = "\\label{tab:model-impacts-valencia}Impacts Spatial Model + MS Valencia (Dependent Variable is log of Price)",
+        align = c("lcccccccc"),
+        col.names = c("Variable", "Direct", "p-val", "Indirect", "p-val", "Total", "p-val"),
+        escape = TRUE) %>%
+  kable_styling(latex_options = c("scale_down")) %>%
+  kableExtra::group_rows(group_label = "Property attributes", start_row = 1, end_row = 13) %>%
+  kableExtra::group_rows(group_label = "Market segments", start_row = 14, end_row = 20) %>%
+  footnote(general = "0.001 in the p-values represents any value less than 0.001")
+```
+
+```{r market-segments-barcelona, echo = FALSE, out.width='100%', fig.cap="\\label{fig:market-segments-barcelona}Spatial market segments in Barcelona according to Stage 1 classification tree"}
+ms_barcelona <- ggplot(barcelona_grid1) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Barcelona_Polygons,
+          color = "lightgray",
+          fill = NA) +
+  scale_color_viridis_d(name = "Market Segment") +
+  ggtitle("Barcelona") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.text = element_blank(),
+        panel.grid = element_blank())
+
+```
+
+```{r market-segments-madrid, echo = FALSE, out.width='100%', fig.cap="\\label{fig:market-segments-madrid}Spatial market segments in Madrid according to Stage 1 classification tree"}
+ms_madrid <- ggplot(madrid_grid1) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Madrid_Polygons,
+          color = "lightgray",
+          fill = NA) +
+  scale_color_viridis_d(name = "Market Segment") +
+  ggtitle("Madrid") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.text = element_blank(),
+        panel.grid = element_blank())
+```
+
+```{r market-segments-valencia, echo = FALSE, out.width='100%', fig.cap="\\label{fig:market-segments-valencia}Spatial market segments in Valencia according to Stage 1 classification tree"}
+ms_valencia <- ggplot(valencia_grid1) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Valencia_Polygons,
+          color = "lightgray",
+          fill = NA) +
+  scale_color_viridis_d(name = "Market Segment") +
+  ggtitle("Valencia") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.text = element_blank(),
+        panel.grid = element_blank())
+```
+
+## Predictive Performance: Comparison of Models
+
+Prediction is a relevant concern in hedonic price analysis. Inspection of the results in Tables \ref{tab:model-results-barcelona}, \ref{tab:model-results-madrid}, and \ref{tab:model-results-valencia} suggest that the introduction of spatial market segments leads to markedly improved model fits. The measures of performance reported in these tables are based on the training sample exclusively. To conclude this investigation, in this section the predictive performance of the models is compared based on their performance using training (in-sample) as well as testing (out-of-sample) data sets. It is important to recall at this point that test data were not used in the calibration of the models discussed in the preceding sections.
+
+The models without a spatially lagged dependent variable assume that the process is not spatially autocorrelated and therefore prediction requires only observations of the exogenous explanatory variables for the property to be assessed, since the price setting mechanism does not include information about the neighbors. In contrast, prediction with the models with a spatial lagged dependent variable require information regarding neighboring dependent and explanatory variables. This increases the data requirements and increase the computational complexity of prediction. Several approaches to spatial prediction with models that include spatially autocorrelated components are discussed in the literature [e.g., @goulard2017]; these are discussed briefly next.
+
+In case of model (\ref{eq:spatial-model-ms}) two types of prediction based on the data can be considered: in- and out-of-sample predictions. In this paper we follow @goulard2017 proposal, as follows: we can reorder the observations in equation (\ref{eq:spatial-model-ms}) to obtain the block matrix form below, where the subscript $S$ denote in-sample (training) data, and the subscript $O$ out-of-sample (testing) data:
+```{=tex}
+\begin{equation}
+  \begin{bmatrix}{Y_S} \\ {Y_O} \end{bmatrix} = \rho \begin{bmatrix}{W_{SS}} & {W_{SO}} \\ {W_{OS}} & {W_{OO}} \end{bmatrix} \begin{bmatrix}{Y_S} \\ {Y_O} \end{bmatrix} + \begin{bmatrix}{X_S} \\ {X_O} \end{bmatrix} \beta + \begin{bmatrix}{\epsilon_S} \\ {\epsilon_O} \end{bmatrix} 
+\label{eq:block-matrix}
+\end{equation}
+```
+
+The _best predictor_ (BP) approach is:
+```{=tex}
+\begin{equation}
+{\hat Y_S^{BP}} = {\hat Y_S^{TC}} - diag({\hat Q_{SS}})^{-1} (\hat Q_{SS}-diag(\hat Q_{SS})) (Y_S - {\hat Y_S^{TC}}) 
+\end{equation}
+```
+\noindent where ${\hat Q_{SS}}={1 \over \hat \sigma^2}(I-\hat \rho {W'_{SS}})(I - \hat \rho W´_{SS})$, $\hat \rho$ is the in-sample spatial dependence estimate parameter and $\hat \sigma^2$ is the estimate variance.
+
+There are four alternatives for out-of-sample prediction:
+```{=tex}
+\begin{equation}
+\begin{array}{llll}
+\hat Y_O^{TC} = [(I-{\hat \rho W})^{-1} {X} \hat \beta]_O  \\[5pt]
+\hat Y_O^{BP} = \hat Y_O^{TC} - \hat Q_{OO}^{-1}\hat Q_{OS}(Y_{S}-\hat Y_S^{TC}) \\[5pt]
+\hat Y_O^{BPN} = \hat Y_O^{TC} - \hat Q_{OO}^{-1}\hat Q_{OJ}(Y_{J}-\hat Y_J^{TC}) \ for \ J=J(O) \\[5pt]
+\hat Y_O^{TS} =X_O \hat \beta + \hat \rho W_{OS}Y_S
+\end{array}
+\end{equation}
+```
+
+Of the four out-of-sample prediction methods we use the Best Predictor (BP) approach. Further detail on these alternatives can be found in @goulard2017. These prediction methods are implemented in the R package **spatialreg** [@bivand2013].
+
+We use several metrics of performance for comparison. Tables \ref{tab:model-performance-barcelona}, \ref{tab:model-performance-madrid}, \ref{tab:model-performance-valencia} report the mean absolute error (mae), median absolute prediction error (mdae), root mean squared error (rmse), mean absolute prediction error (mape), median absolute prediction error (medape), bias, percent bias (pc_bias) and hit rates. The latter are the proportion of predictions smaller than a given absolute deviation in percentage. For instance, the 5% hit rate (hit_rate_5) of the linear model for Barcelona is a 98%, therefore 98% of all observations have an absolute percent error smaller than a 5%.
+
+The results indicate that adding market segments and/or a spatially lagged variable improve the linear base model. The spatial model with market segments is comparable to or better than the spatial model without market segments. For example, the in- and out-of-sample predictions in Valencia perform very similarly in these two models. In Madrid and Valencia the results of the spatial model with market segment are superior for both the in-sample and the out-of-sample predictions.
+
+```{r results-barcelona, echo=FALSE}
+barcelona_performance.df %>%
+  dplyr::select(-City, -Training_Date, -hit_ratio_20, -hit_ratio_50) %>%
+  kable("latex",
+        booktabs = TRUE,
+        digits = 3,
+        caption = "\\label{tab:model-performance-barcelona}Model performance comparison: Barcelona") %>%
+  kable_styling(latex_options = c("scale_down")) %>%
+  kableExtra::group_rows(group_label = "Base Model", start_row = 1, end_row = 2) %>%
+  kableExtra::group_rows(group_label = "Base Model + Market Segments", start_row = 3, end_row = 4) %>%
+  kableExtra::group_rows(group_label = "Spatial Model", start_row = 5, end_row = 6) %>%
+  kableExtra::group_rows(group_label = "Spatial Model + Market Segments", start_row = 7, end_row = 8)
+```
+
+```{r results-madrid, echo=FALSE}
+madrid_performance.df %>%
+  dplyr::select(-City, -Training_Date, -hit_ratio_20, -hit_ratio_50) %>%
+  kable("latex",
+        booktabs = TRUE,
+        digits = 3,
+        caption = "\\label{tab:model-performance-madrid}Model performance comparison: Madrid") %>%
+  kable_styling(latex_options = c("scale_down")) %>%
+  kableExtra::group_rows(group_label = "Base Model", start_row = 1, end_row = 2) %>%
+  kableExtra::group_rows(group_label = "Base Model + Market Segments", start_row = 3, end_row = 4) %>%
+  kableExtra::group_rows(group_label = "Spatial Model", start_row = 5, end_row = 6) %>%
+  kableExtra::group_rows(group_label = "Spatial Model + Market Segments", start_row = 7, end_row = 8)
+```
+
+
+```{r results-valencia, echo=FALSE}
+valencia_performance.df %>%
+  dplyr::select(-City, -Training_Date, -hit_ratio_20, -hit_ratio_50) %>%
+  kable("latex",
+        booktabs = TRUE,
+        digits = 3,
+        caption = "\\label{tab:model-performance-valencia}Model performance comparison: Valencia") %>%
+  kable_styling(latex_options = c("scale_down")) %>%
+  kableExtra::group_rows(group_label = "Base Model", start_row = 1, end_row = 2) %>%
+  kableExtra::group_rows(group_label = "Base Model + Market Segments", start_row = 3, end_row = 4) %>%
+  kableExtra::group_rows(group_label = "Spatial Model", start_row = 5, end_row = 6) %>%
+  kableExtra::group_rows(group_label = "Spatial Model + Market Segments", start_row = 7, end_row = 8)
+```
+
+
+
+Conclusions
+===================
+
+Market segmentation is a topic of interest in the literature on real estate appraisal and valuation. In addition to being conceptually sound, numerous studies throughout the years have demonstrated that the practice of identifying market segments for hedonic price analysis can lead to higher quality models and enhanced performance.
+
+The contribution of this paper has been to demonstrate a modelling strategy to obtain flexible tree-based market segments for use in spatial hedonic price modeling. Implementation of regression trees for market segmentation was proposed in a recent paper by @Fuss2016role. Our modelling strategy differs to the one proposed by these authors in two respects: 1) the use of decision trees with flexible (i.e. non-orthogonal and possibly non-linear market boundaries); and 2) the timing of the estimations of the market segments, which in the case of @Fuss2016role is based on the residuals of an initial regression model, whereas in our case it is done in the first step of the modelling strategy. 
+
+The results using three large data sets from cities in Spain indicate that modelling the market segments can improve the fit of the models, as well as their predictive performance. The best model consistently included a spatially lagged dependent variable and market segments. The market segments in addition to improving the fit and the predictive performance also reduced the magnitude of the spatial lag parameter, thus allocating some of the spatial effect to regional heterogeneity that would otherwise be assumed to be micro-scale information spillovers. Overall, the results serve to demonstrate the potential of the proposed modelling strategy to produce better models and more accurate predictions.
+
+One direction for future research is to investigate the temporal stability of spatial market segments. It is well known that there are seasonal effects in housing markets, but an open research question is whether spatial market segments experience seasonal variations, both in terms of their geographical extent as well as the magnitude of their effects. Another possibility is that there are longer term trends (e.g., gentrification) that could affect the spatial configuration of the market segments. Both seasonality and/or longer term trends would require multi-year data sets, compared to the single-year data set that we used for this research. For the time being, it is important to note that the results presented in this paper support the argument that the two-step method described in this paper performs well for now-casting or relatively short term forecasts. Given the dearth of information about seasonality and temporal stability of spatial market segments, any attempt to use them for longer term forecasts should be done with caution.
+
+Finally, the study was designed as an example of reproducible research: all code and data used in this research is publicly available which should allow other researchers reproduce our results or expand them in other directions.
+
+# Supplemental material
+
+Supplemental material for this article is available.
+

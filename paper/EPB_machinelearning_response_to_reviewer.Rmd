@@ -1,0 +1,840 @@
+---
+title: "Using machine learning to identify spatial market segments: A reproducible study of major Spanish markets - Response to reviewers"
+bibliography: bibliography.bib
+output: pdf_document
+---
+
+```{r install-data-package, include = FALSE}
+# Run only once if needed to install data package `sobiEquity`
+if (!require("idealista18", character.only = TRUE)) {
+      devtools::install_github("https://github.com/paezha/idealista18")
+  }
+```
+
+```{r setup,  cache=FALSE, warning = FALSE, include=FALSE, message = FALSE}
+library(benchmarkme)
+library(idealista18)
+library(fastDummies)
+library(geosphere)
+library(here)
+library(idealista18)
+library(kableExtra)
+library(lmtest)
+library(Metrics)
+library(spatialreg)
+library(spdep)
+library(sf)
+library(tidyverse)
+library(tree)
+```
+
+```{r seed-for-replicability, include=FALSE}
+config <- list()
+config$seed <- 2342324 # For replicability
+```
+
+```{r split-proportion, include=FALSE}
+config$Train_Split_Proportion <- 0.7
+```
+
+```{r base-code-preparation, include=FALSE, eval=FALSE}
+
+# This is the base code for preparing the data for analysis
+# IMPORTANT: THESE CHUNKS ARE NOT EVALUATED HERE - KEEP eval=FALSE
+
+#################
+# Preliminaries #
+#################
+
+# Extract UTM coordinates:
+coords.utm <- assets.sf %>% 
+  st_transform(crs = 32630) %>%
+  st_coordinates()
+
+# Add UTM coordinates to `assets.sf`:
+assets.sf <- cbind(assets.sf, coords.utm)
+
+# Center and scale coordinates for work with regression trees. Center on city center:
+max.range <- max(max(assets.sf$X) - min(assets.sf$X),
+                 max(assets.sf$Y) - min(assets.sf$Y))
+
+# Obtain coordinates of City Center in UTM:
+city.center.utm <- st_point(c(pois.df.list$City_Center$Lon,pois.df.list$City_Center$Lat)) %>%
+  st_sfc(crs = 4326) %>%
+  st_transform(crs = 32630) %>%
+  st_coordinates()
+
+# Center and scale coordinates for work with regression trees. Center on City Center, 
+# scale by maximum range of observation:
+assets.sf <- assets.sf %>%
+  mutate(X = (X - city.center.utm[1])/max.range, 
+         Y = (Y - city.center.utm[2])/max.range)
+
+# Add interactions as per the IBF approach (see Paez, Lopez, Ruiz, Camacho, 2019):
+assets.sf <- assets.sf %>%
+  mutate(LOGPRICE = log(PRICE),
+         X_p_Y = X + Y, 
+         X2_p_Y2 = X^2 + Y^2,
+         X_x_Y = X * Y, 
+         X2 = X^2, Y2 = Y^2)
+
+# Data frame after dropping geometry
+assets.df <- assets.sf %>%
+  st_drop_geometry()
+
+# Set seed for replicability
+set.seed(config$seed)
+
+# Proportion of sample for training the models 
+train.splits <- sample(1:dim(assets.sf)[1],
+                         size=round(dim(assets.df)[1]*config$Train_Split_Proportion))
+
+# Rownames used for prediction
+rn <- row.names(assets.sf)
+rn.train <- as.numeric(rn[train.splits])
+rn.test <- as.numeric(rn[-train.splits])
+
+# Train and test sf data.frames
+assets.train.sf <- assets.sf[train.splits,]
+assets.test.sf <- assets.sf[-train.splits,]
+
+# Train and test df data.frames
+assets.train.df <- assets.train.sf %>% 
+  st_drop_geometry()
+assets.test.df <- assets.test.sf %>% 
+  st_drop_geometry()
+```
+
+```{r base-code-analysis, include=FALSE, eval=FALSE}
+
+# This is the base code for the analysis
+# IMPORTANT: THESE CHUNKS ARE NOT EVALUATED HERE - KEEP eval=FALSE
+
+# Define the formula for the models
+model.formula <- as.formula(paste(config$Target_Variable, "~ ",
+      paste(str_split(config$Features$Basic, " "), collapse=" + "),
+      sep = ""))
+
+#############################################
+# Spatial Submarkets                        #
+#############################################
+
+# Estimate complete regression tree with coordinates and interactive basis functions. Summarize the results:
+submarkets.reg.tree.model <- tree(as.formula(paste(config$Target_Variable,
+                                                   "~  X + Y + X_p_Y + X2_p_Y2 + X_x_Y")), 
+                                  data = assets.train.sf)
+# Create prediction grid:
+grid1 <- st_make_grid(neighborhoods_polygons %>%
+                        st_transform(crs = 32630), 
+                      n = 100, 
+                      what = "centers") %>% 
+  st_sf()
+
+# Clip prediction grid:
+grid1 <- grid1[neighborhoods_polygons %>%
+                        st_transform(crs = 32630),]
+
+grid1 <- grid1 %>%
+#  st_transform(crs = 32630) %>%
+  st_coordinates() %>%
+  cbind(grid1) %>%
+  mutate(X = (X - city.center.utm[1])/max.range, 
+         Y = (Y - city.center.utm[2])/max.range)
+
+grid1 <- grid1 %>%
+  mutate(X_p_Y = X + Y, 
+         X2_p_Y2 = X^2 + Y^2,
+         X_x_Y = X * Y)
+
+grid1$pred <- predict(submarkets.reg.tree.model, 
+                      newdata = grid1)
+
+z.label.names <- c(paste0("Z", 1:length(unique(grid1$pred))))
+
+grid1$market_segment <- factor(grid1$pred,
+                             labels = z.label.names)
+
+# Append market segments to data frames
+assets.train.sf$market_segment <- factor(predict(submarkets.reg.tree.model, 
+                                        newdata = assets.train.sf), 
+                                      labels = z.label.names)
+
+assets.test.sf$market_segment <- factor(predict(submarkets.reg.tree.model, 
+                                        newdata = assets.test.sf), 
+                                      labels = z.label.names)
+
+```
+
+We would like to begin by thanking you for the careful, thoughtful review of the paper. We appreciate the constructive criticism and the opportunity to improve the paper. For your convenience, a version of the paper with all changes tracked is included in this revision.
+
+# First Comment 
+
+1.(a) The authors claim that machine learning techniques are often black boxes generating results which are often counterintuitive and estimates which are not stable enough to support,  e.g.,  the  decision  making  of commercial  banks  in  their   lending process  by estimating  a  correct  collateral  value.  Obviously,  their  approach  avoids  this  issue  by simply using classification tree  technique  in  the  first  step.  However, there  are  causalmachine  learning  approaches  nowadays, which overcome  such  problems  (at  least  to some extent)  (see, e.g., Knaus, Lechner, and Strittmatter (2021)). I believe that the paper would benefit from such a discussion.
+
+> This is a fair point. An emergent body of research aims at increasing the interpretability of machine learning methods, including @du2019techniques, @murdoch2019definitions, and most recently, as you point out, by @knaus2021machine. This is an area of research that is quickly evolving, although it is not without critics [e.g., @rudin2019stop]. Currently, existing approaches depend on fairly strong assumptions. For example, the causal forest framework [@wager2018estimation] assumes that the leaves of trees are sufficiently small so that paired treatment indicators and outcomes behave as if they were a randomized experiment. Assuming independence is often inappropriate in the analysis of spatial data, and techniques that correctly treat spatial dependencies are mature. It is possible that in the future interpretable machine learning techniques will address these issues, so we are advised to pay attention to this stream of research. 
+
+> We have added a footnote to expand our discussion about the potential of interpretable machine learning.
+
+# Second Comment 
+
+2.(a) On  page  5,  the  authors  highlight  the  advantage  of  their  modeling  strategy  inidentifying market segments    compared to the one proposed by Füss and Koller (2016). It is not entirely clear to me why the use of prices is a better choice. The use of residuals might be adequate as well if the model provides causal effects (see previous comment).In other words, what kind of information about the location are incorporated into the price which  we  do  not  see  in  the  residuals.  I  believe  that  this  essential part  needs  a more detailed discussion.
+
+> Thank you for this comment. Regression tree estimates are the mean of the values contained in the volume of a leaf, which is to say a constant value. In a geographical application the leaves are mutually exclusive and collectively exhaustive partitions of geographical space. Using the residuals as a second step of the modelling strategy automatically results in spatial autocorrelation, since all properties in the same segment will be assigned estimated residuals that are identical. The issue here is that by inducing spatial autocorrelation in the second step some of the spatial information about location is obscured (i.e., there is zero spatial variation in the estimation for a given market segment). Our method avoids this by modelling the prices first to obtain market segments with good homogeneity properties. Any spatial autocorrelation is dealt with by means of the spatial econometric model in the second step. 
+
+> This is discussed in the text of the revised version of the paper.
+
+# Third Comment 
+
+3.(a) The empirical analysis only includes cross-sectional data for 2018Q4. However, it would be interesting to see how homogeneous neighborhoods change over time and space, e.g., due to gentrification. 
+
+> Thank you for this fascinating suggestion. We are not aware of any research that investigates the stability of spatial market segments. A search on Web of Science using the following arguments returns 33 documents:
+
+> housing (Topic) AND space or spatial or geograph* (Topic) AND "market segments" or "market segment" (Topic)
+
+> A search using the following arguments in contrast returns zero documents:
+
+> housing (Topic) AND space or spatial or geograph* (Topic) AND "market segments" or "market segment" (Topic) AND season* or stability (Topic)
+
+> It is possible that spatial market segments experience seasonality and/or other temporal trends. Given the dearth of knowledge on this matter, we suggest that this question is an interesting topic for future research.
+
+> Out of curiosity, we modelled the market segments for each of four quarters covered by our data sets (see Figs. \ref{fig:all-market-segments-barcelona}, \ref{fig:all-market-segments-madrid}, and \ref{fig:all-market-segments-valencia} in this letter). As seen in the figures, the spatial market segments for 2018 are relatively stable for Barcelona and Madrid, but change somewhat more noticeably for Valencia in the course of the year. The differences need to be understood in the context of the coefficients estimated by the model for each segment, which may be still relativelly homogeneous. In any case, it is difficult to say how much of the variation observed could be random, or whether changes in the spatial segments cycle over longer periods of time in seasonal patterns (e.g., that the market segments change between winter and summer).
+
+> A limitation that we face to study more in depth the question of gentrification and the stability of market segments (in addition of course to space in the current paper), is the fact that gentrification and seasonality processes probably operate over longer periods than the year we investigate here. Furthermore, to publicly release this data sets we had to obtain permission from the legal department of idealista, and a practical constraint is that we were not allowed to share data sets spanning several years.
+
+> That said, our argument is that the two-step approach produces good results on a cotemporaneous test sample. This suggest that the method is useful in nowcasting or short-term forecasting. We have added a caveat in the conclusings about the potential seasonality of the market segments, so any attempt to use them for longer term forecasts should be treated with caution, as follows:
+
+> "One direction for future research is to investigate the temporal stability of spatial market segments. It is well known that there are seasonal effects in housing markets, but an open research question is whether spatial market segments experience seasonal variations, both in terms of their geographical extent as well as the magnitude of their effects. Another possibility is that there are longer term trends (e.g., gentrification) that could affect the spatial configuration of the market segments. Both seasonality and/or longer term trends would require multi-year data sets, compared to the single-year data set that we used for this research. For the time being, it is important to note that the results presented in this paper support the argument that the two-step method described in this paper performs well for now-casting or relatively short term forecasts. Given the dearth of information about seasonality and temporal stability of spatial market segments, any attempt to use them for longer term forecasts should be done with caution."
+
+```{r change-config-barcelona, include=FALSE}
+config$City <- "Barcelona"
+config$Target_Variable <- "LOGPRICE"
+config$Features$Basic <- c("CONSTRUCTEDAREA",
+                           "ROOMNUMBER",
+                           "BATHNUMBER",
+                           "HASTERRACE",
+                           "HASLIFT",
+                           "HASAIRCONDITIONING",
+                           "HASSWIMMINGPOOL",
+                           "ISSTUDIO",
+                           "ISINTOPFLOOR",
+                           "HASPARKINGSPACE",
+                           #"DISTANCE_TO_METRO",
+                           "DISTANCE_TO_CITY_CENTER")#,
+                           #"DISTANCE_TO_DIAGONAL")
+config$Features$Surface <- c("X",
+                             "Y",
+                             "X2",
+                             "Y2",
+                             "X_x_Y")
+```
+
+```{r select-barcelona-03, include=FALSE}
+#Designate dataset to use and filter by period as desired
+assets.sf <- Barcelona_Sale %>%
+  filter(PERIOD == 201803)
+
+#Removes duplicated coordinates
+assets.sf <- assets.sf %>% 
+  distinct(LATITUDE, 
+           LONGITUDE, 
+           .keep_all = TRUE)
+
+neighborhoods_polygons <- Barcelona_Polygons
+
+pois.df.list <- Barcelona_POIS
+```
+
+```{r prepare-barcelona-03, ref.label = 'base-code-preparation', include=FALSE}
+
+```
+
+```{r analysis-barcelona-03, cache = TRUE, ref.label = 'base-code-analysis', include=FALSE}
+
+```
+
+```{r models-barcelona-03, echo=FALSE}
+barcelona_grid1_03 <- grid1
+```
+
+```{r select-barcelona-06, include=FALSE}
+#Designate dataset to use and filter by period as desired
+assets.sf <- Barcelona_Sale %>%
+  filter(PERIOD == 201806)
+
+#Removes duplicated coordinates
+assets.sf <- assets.sf %>% 
+  distinct(LATITUDE, 
+           LONGITUDE, 
+           .keep_all = TRUE)
+
+neighborhoods_polygons <- Barcelona_Polygons
+
+pois.df.list <- Barcelona_POIS
+```
+
+```{r prepare-barcelona-06, ref.label = 'base-code-preparation', include=FALSE}
+
+```
+
+```{r analysis-barcelona-06, cache = TRUE, ref.label = 'base-code-analysis', include=FALSE}
+
+```
+
+```{r models-barcelona-06, echo=FALSE}
+barcelona_grid1_06 <- grid1
+```
+
+```{r select-barcelona-09, include=FALSE}
+#Designate dataset to use and filter by period as desired
+assets.sf <- Barcelona_Sale %>%
+  filter(PERIOD == 201809)
+
+#Removes duplicated coordinates
+assets.sf <- assets.sf %>% 
+  distinct(LATITUDE, 
+           LONGITUDE, 
+           .keep_all = TRUE)
+
+neighborhoods_polygons <- Barcelona_Polygons
+
+pois.df.list <- Barcelona_POIS
+```
+
+```{r prepare-barcelona-09, ref.label = 'base-code-preparation', include=FALSE}
+
+```
+
+```{r analysis-barcelona-09, cache = TRUE, ref.label = 'base-code-analysis', include=FALSE}
+
+```
+
+```{r models-barcelona-09, echo=FALSE}
+barcelona_grid1_09 <- grid1
+```
+
+```{r select-barcelona-12, include=FALSE}
+#Designate dataset to use and filter by period as desired
+assets.sf <- Barcelona_Sale %>%
+  filter(PERIOD == 201812)
+
+#Removes duplicated coordinates
+assets.sf <- assets.sf %>% 
+  distinct(LATITUDE, 
+           LONGITUDE, 
+           .keep_all = TRUE)
+
+neighborhoods_polygons <- Barcelona_Polygons
+
+pois.df.list <- Barcelona_POIS
+```
+
+```{r prepare-barcelona-12, ref.label = 'base-code-preparation', include=FALSE}
+
+```
+
+```{r analysis-barcelona-12, cache = TRUE, ref.label = 'base-code-analysis', include=FALSE}
+
+```
+
+```{r models-barcelona-12, echo=FALSE}
+barcelona_grid1_12 <- grid1
+```
+
+```{r, echo = FALSE, message=FALSE, fig.width=5, fig.cap="\\label{fig:all-market-segments-barcelona}Spatial market segments according to Stage 1 classification tree for Barcelona Q1 through Q4"}
+library("gridExtra")
+ms_barcelona_03 <- ggplot(barcelona_grid1_03) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Barcelona_Polygons,
+          color = "lightgray",size=.2,
+          fill = NA) +
+  scale_color_viridis_d(name = "Q1: Market Segment") +
+  theme_bw(base_size = 5) +
+  theme(legend.position = "bottom",
+        #legend.title = element_blank(),
+        axis.text.x = element_text(size=2),
+        axis.text.y = element_text(size=2,angle=90),
+        plot.margin=unit(c(0.1,0.1,0.1,0.1),"cm"),
+        legend.key.size = unit(0.2, 'cm'))
+
+ms_barcelona_06 <- ggplot(barcelona_grid1_06) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Barcelona_Polygons,
+          color = "lightgray",size=.2,
+          fill = NA) +
+  scale_color_viridis_d(name = "Q2: Market Segment") +
+  theme_bw(base_size = 5) +
+  theme(legend.position = "bottom",
+        #legend.title = element_blank(),
+        axis.text.x = element_text(size=2),
+        axis.text.y = element_text(size=2,angle=90),
+        plot.margin=unit(c(0.1,0.1,0.1,0.1),"cm"),
+        legend.key.size = unit(0.2, 'cm'))
+
+ms_barcelona_09 <- ggplot(barcelona_grid1_09) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Barcelona_Polygons,
+          color = "lightgray",size=.2,
+          fill = NA) +
+  scale_color_viridis_d(name = "Q3: Market Segment") +
+  theme_bw(base_size = 5) +
+  theme(legend.position = "bottom",
+        #legend.title = element_blank(),
+        axis.text.x = element_text(size=2),
+        axis.text.y = element_text(size=2,angle=90),
+        plot.margin=unit(c(0.1,0.1,0.1,0.1),"cm"),
+        legend.key.size = unit(0.2, 'cm'))
+
+ms_barcelona_12 <- ggplot(barcelona_grid1_12) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Barcelona_Polygons,
+          color = "lightgray",size=.2,
+          fill = NA) +
+  scale_color_viridis_d(name = "Q4: Market Segment") +
+  theme_bw(base_size = 5) +
+  theme(legend.position = "bottom",
+        #legend.title = element_blank(),
+        axis.text.x = element_text(size=2),
+        axis.text.y = element_text(size=2,angle=90),
+        plot.margin=unit(c(0.1,0.1,0.1,0.1),"cm"),
+        legend.key.size = unit(0.2, 'cm'))
+
+grid.arrange(ms_barcelona_03, ms_barcelona_06, ms_barcelona_09, ms_barcelona_12, 
+             ncol=2, nrow = 2)
+```
+
+```{r change-config-madrid, include=FALSE}
+config$City <- "Madrid"
+config$Target_Variable <- "LOGPRICE"
+config$Features$Basic <- c("CONSTRUCTEDAREA",
+                           "ROOMNUMBER",
+                           "BATHNUMBER",
+                           "HASTERRACE",
+                           "HASLIFT",
+                           "HASAIRCONDITIONING",
+                           "HASSWIMMINGPOOL",
+                           "ISSTUDIO",
+                           "ISINTOPFLOOR",
+                           "HASPARKINGSPACE",
+                           #"DISTANCE_TO_METRO",
+                           "DISTANCE_TO_CITY_CENTER")#,
+                           #"DISTANCE_TO_DIAGONAL")
+config$Features$Surface <- c("X",
+                             "Y",
+                             "X2",
+                             "Y2",
+                             "X_x_Y")
+```
+
+```{r select-madrid-03, include=FALSE}
+#Designate dataset to use and filter by period as desired
+assets.sf <- Madrid_Sale %>%
+  filter(PERIOD == 201803)
+
+#Removes duplicated coordinates
+assets.sf <- assets.sf %>% 
+  distinct(LATITUDE, 
+           LONGITUDE, 
+           .keep_all = TRUE)
+
+neighborhoods_polygons <- Madrid_Polygons
+
+pois.df.list <- Madrid_POIS
+```
+
+```{r prepare-madrid-03, ref.label = 'base-code-preparation', include=FALSE}
+
+```
+
+```{r analysis-madrid-03, cache = TRUE, ref.label = 'base-code-analysis', include=FALSE}
+
+```
+
+```{r models-madrid-03, echo=FALSE}
+madrid_grid1_03 <- grid1
+```
+
+```{r select-madrid-06, include=FALSE}
+#Designate dataset to use and filter by period as desired
+assets.sf <- Madrid_Sale %>%
+  filter(PERIOD == 201806)
+
+#Removes duplicated coordinates
+assets.sf <- assets.sf %>% 
+  distinct(LATITUDE, 
+           LONGITUDE, 
+           .keep_all = TRUE)
+
+neighborhoods_polygons <- Madrid_Polygons
+
+pois.df.list <- Madrid_POIS
+```
+
+```{r prepare-madrid-06, ref.label = 'base-code-preparation', include=FALSE}
+
+```
+
+```{r analysis-madrid-06, cache = TRUE, ref.label = 'base-code-analysis', include=FALSE}
+
+```
+
+```{r models-madrid-06, echo=FALSE}
+madrid_grid1_06 <- grid1
+```
+
+```{r select-madrid-09, include=FALSE}
+#Designate dataset to use and filter by period as desired
+assets.sf <- Madrid_Sale %>%
+  filter(PERIOD == 201809)
+
+#Removes duplicated coordinates
+assets.sf <- assets.sf %>% 
+  distinct(LATITUDE, 
+           LONGITUDE, 
+           .keep_all = TRUE)
+
+neighborhoods_polygons <- Madrid_Polygons
+
+pois.df.list <- Madrid_POIS
+```
+
+```{r prepare-madrid-09, ref.label = 'base-code-preparation', include=FALSE}
+
+```
+
+```{r analysis-madrid-09, cache = TRUE, ref.label = 'base-code-analysis', include=FALSE}
+
+```
+
+```{r models-madrid-09, echo=FALSE}
+madrid_grid1_09 <- grid1
+```
+
+```{r select-madrid-12, include=FALSE}
+#Designate dataset to use and filter by period as desired
+assets.sf <- Madrid_Sale %>%
+  filter(PERIOD == 201812)
+
+#Removes duplicated coordinates
+assets.sf <- assets.sf %>% 
+  distinct(LATITUDE, 
+           LONGITUDE, 
+           .keep_all = TRUE)
+
+neighborhoods_polygons <- Madrid_Polygons
+
+pois.df.list <- Madrid_POIS
+```
+
+```{r prepare-madrid-12, ref.label = 'base-code-preparation', include=FALSE}
+
+```
+
+```{r analysis-madrid-12, cache = TRUE, ref.label = 'base-code-analysis', include=FALSE}
+
+```
+
+```{r models-madrid-12, echo=FALSE}
+madrid_grid1_12 <- grid1
+```
+
+```{r, echo = FALSE, message=FALSE, fig.width=5, fig.cap="\\label{fig:all-market-segments-madrid}Spatial market segments according to Stage 1 classification tree for Madrid Q1 through Q4"}
+library("gridExtra")
+ms_madrid_03 <- ggplot(madrid_grid1_03) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Madrid_Polygons,
+          color = "lightgray",size=.2,
+          fill = NA) +
+  scale_color_viridis_d(name = "Q1: Market Segment") +
+  theme_bw(base_size = 5) +
+  theme(legend.position = "bottom",
+        #legend.title = element_blank(),
+        axis.text.x = element_text(size=2),
+        axis.text.y = element_text(size=2,angle=90),
+        plot.margin=unit(c(0.1,0.1,0.1,0.1),"cm"),
+        legend.key.size = unit(0.2, 'cm'))
+
+ms_madrid_06 <- ggplot(madrid_grid1_06) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Madrid_Polygons,
+          color = "lightgray",size=.2,
+          fill = NA) +
+  scale_color_viridis_d(name = "Q2: Market Segment") +
+  theme_bw(base_size = 5) +
+  theme(legend.position = "bottom",
+        #legend.title = element_blank(),
+        axis.text.x = element_text(size=2),
+        axis.text.y = element_text(size=2,angle=90),
+        plot.margin=unit(c(0.1,0.1,0.1,0.1),"cm"),
+        legend.key.size = unit(0.2, 'cm'))
+
+ms_madrid_09 <- ggplot(madrid_grid1_09) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Madrid_Polygons,
+          color = "lightgray",size=.2,
+          fill = NA) +
+  scale_color_viridis_d(name = "Q3: Market Segment") +
+  theme_bw(base_size = 5) +
+  theme(legend.position = "bottom",
+        #legend.title = element_blank(),
+        axis.text.x = element_text(size=2),
+        axis.text.y = element_text(size=2,angle=90),
+        plot.margin=unit(c(0.1,0.1,0.1,0.1),"cm"),
+        legend.key.size = unit(0.2, 'cm'))
+
+ms_madrid_12 <- ggplot(madrid_grid1_12) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Madrid_Polygons,
+          color = "lightgray",size=.2,
+          fill = NA) +
+  scale_color_viridis_d(name = "Q4: Market Segment") +
+  theme_bw(base_size = 5) +
+  theme(legend.position = "bottom",
+        #legend.title = element_blank(),
+        axis.text.x = element_text(size=2),
+        axis.text.y = element_text(size=2,angle=90),
+        plot.margin=unit(c(0.1,0.1,0.1,0.1),"cm"),
+        legend.key.size = unit(0.2, 'cm'))
+
+grid.arrange(ms_madrid_03, ms_madrid_06, ms_madrid_09, ms_madrid_12, 
+             ncol=2, nrow = 2)
+```
+
+
+```{r change-config-valencia, include=FALSE}
+config$City <- "Valencia"
+config$Target_Variable <- "LOGPRICE"
+config$Features$Basic <- c("CONSTRUCTEDAREA",
+                           "ROOMNUMBER",
+                           "BATHNUMBER",
+                           "HASTERRACE",
+                           "HASLIFT",
+                           "HASAIRCONDITIONING",
+                           "HASSWIMMINGPOOL",
+                           "ISSTUDIO",
+                           "ISINTOPFLOOR",
+                           "HASPARKINGSPACE",
+                           #"DISTANCE_TO_METRO",
+                           "DISTANCE_TO_CITY_CENTER")#,
+                           #"DISTANCE_TO_DIAGONAL")
+config$Features$Surface <- c("X",
+                             "Y",
+                             "X2",
+                             "Y2",
+                             "X_x_Y")
+```
+
+```{r select-valencia-03, include=FALSE}
+#Designate dataset to use and filter by period as desired
+assets.sf <- Valencia_Sale %>%
+  filter(PERIOD == 201803)
+
+#Removes duplicated coordinates
+assets.sf <- assets.sf %>% 
+  distinct(LATITUDE, 
+           LONGITUDE, 
+           .keep_all = TRUE)
+
+neighborhoods_polygons <- Valencia_Polygons
+
+pois.df.list <- Valencia_POIS
+```
+
+```{r prepare-valencia-03, ref.label = 'base-code-preparation', include=FALSE}
+
+```
+
+```{r analysis-valencia-03, cache = TRUE, ref.label = 'base-code-analysis', include=FALSE}
+
+```
+
+```{r models-valencia-03, echo=FALSE}
+valencia_grid1_03 <- grid1
+```
+
+```{r select-valencia-06, include=FALSE}
+#Designate dataset to use and filter by period as desired
+assets.sf <- Valencia_Sale %>%
+  filter(PERIOD == 201806)
+
+#Removes duplicated coordinates
+assets.sf <- assets.sf %>% 
+  distinct(LATITUDE, 
+           LONGITUDE, 
+           .keep_all = TRUE)
+
+neighborhoods_polygons <- Valencia_Polygons
+
+pois.df.list <- Valencia_POIS
+```
+
+```{r prepare-valencia-06, ref.label = 'base-code-preparation', include=FALSE}
+
+```
+
+```{r analysis-valencia-06, cache = TRUE, ref.label = 'base-code-analysis', include=FALSE}
+
+```
+
+```{r models-valencia-06, echo=FALSE}
+valencia_grid1_06 <- grid1
+```
+
+```{r select-valencia-09, include=FALSE}
+#Designate dataset to use and filter by period as desired
+assets.sf <- Valencia_Sale %>%
+  filter(PERIOD == 201809)
+
+#Removes duplicated coordinates
+assets.sf <- assets.sf %>% 
+  distinct(LATITUDE, 
+           LONGITUDE, 
+           .keep_all = TRUE)
+
+neighborhoods_polygons <- Valencia_Polygons
+
+pois.df.list <- Valencia_POIS
+```
+
+```{r prepare-valencia-09, ref.label = 'base-code-preparation', include=FALSE}
+
+```
+
+```{r analysis-valencia-09, cache = TRUE, ref.label = 'base-code-analysis', include=FALSE}
+
+```
+
+```{r models-valencia-09, echo=FALSE}
+valencia_grid1_09 <- grid1
+```
+
+```{r select-valencia-12, include=FALSE}
+#Designate dataset to use and filter by period as desired
+assets.sf <- Valencia_Sale %>%
+  filter(PERIOD == 201812)
+
+#Removes duplicated coordinates
+assets.sf <- assets.sf %>% 
+  distinct(LATITUDE, 
+           LONGITUDE, 
+           .keep_all = TRUE)
+
+neighborhoods_polygons <- Valencia_Polygons
+
+pois.df.list <- Valencia_POIS
+```
+
+```{r prepare-valencia-12, ref.label = 'base-code-preparation', include=FALSE}
+
+```
+
+```{r analysis-valencia-12, cache = TRUE, ref.label = 'base-code-analysis', include=FALSE}
+
+```
+
+```{r models-valencia-12, echo=FALSE}
+valencia_grid1_12 <- grid1
+```
+
+```{r, echo = FALSE, message=FALSE, fig.width=5, fig.cap="\\label{fig:all-market-segments-valencia}Spatial market segments according to Stage 1 classification tree for Valencia Q1 through Q4"}
+library("gridExtra")
+ms_valencia_03 <- ggplot(valencia_grid1_03) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Valencia_Polygons,
+          color = "lightgray",size=.2,
+          fill = NA) +
+  scale_color_viridis_d(name = "Q1: Market Segment") +
+  theme_bw(base_size = 5) +
+  theme(legend.position = "bottom",
+        #legend.title = element_blank(),
+        axis.text.x = element_text(size=2),
+        axis.text.y = element_text(size=2,angle=90),
+        plot.margin=unit(c(0.1,0.1,0.1,0.1),"cm"),
+        legend.key.size = unit(0.2, 'cm'))
+
+ms_valencia_06 <- ggplot(valencia_grid1_06) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Valencia_Polygons,
+          color = "lightgray",size=.2,
+          fill = NA) +
+  scale_color_viridis_d(name = "Q2: Market Segment") +
+  theme_bw(base_size = 5) +
+  theme(legend.position = "bottom",
+        #legend.title = element_blank(),
+        axis.text.x = element_text(size=2),
+        axis.text.y = element_text(size=2,angle=90),
+        plot.margin=unit(c(0.1,0.1,0.1,0.1),"cm"),
+        legend.key.size = unit(0.2, 'cm'))
+
+ms_valencia_09 <- ggplot(valencia_grid1_09) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Valencia_Polygons,
+          color = "lightgray",size=.2,
+          fill = NA) +
+  scale_color_viridis_d(name = "Q3: Market Segment") +
+  theme_bw(base_size = 5) +
+  theme(legend.position = "bottom",
+        #legend.title = element_blank(),
+        axis.text.x = element_text(size=2),
+        axis.text.y = element_text(size=2,angle=90),
+        plot.margin=unit(c(0.1,0.1,0.1,0.1),"cm"),
+        legend.key.size = unit(0.2, 'cm'))
+
+ms_valencia_12 <- ggplot(valencia_grid1_12) +
+  geom_sf(aes(color = market_segment)) + 
+  geom_sf(data = Valencia_Polygons,
+          color = "lightgray",size=.2,
+          fill = NA) +
+  scale_color_viridis_d(name = "Q4: Market Segment") +
+  theme_bw(base_size = 5) +
+  theme(legend.position = "bottom",
+        #legend.title = element_blank(),
+        axis.text.x = element_text(size=2),
+        axis.text.y = element_text(size=2,angle=90),
+        plot.margin=unit(c(0.1,0.1,0.1,0.1),"cm"),
+        legend.key.size = unit(0.2, 'cm'))
+
+grid.arrange(ms_valencia_03, ms_valencia_06, ms_valencia_09, ms_valencia_12, 
+             ncol=2, nrow = 2)
+```
+
+3.(b) I also do not understand why the authors include the three cities which might by nature be more homogenous than smaller cities or rural areas (or high versus less populated areas). How do they differ in terms of city size, average income, local gdp etc.? 
+
+> In regard to the selection of the cities: at the beginning, we thought to release data just on Madrid but we believed that releasing open data for the three largest cities in Spain would be attractive for other researchers and that it would allow us to test the consistency of results in two big metropolises and a medium-size city such as Valencia. Our choice of cities was determined purely by the permissions we could obtain to share the data publicly to increase the reproducibility of the research. A systematic comparison of conditions by city attributes is beyond the scope of the present paper.
+
+3.(c) It seems that some of the coefficients change sign among the cities. For instance, why does the price decreases when the number of rooms increases in Madrid? 
+
+> Thank you for this question. It is important to note that in models with spatial autocorrelation the coefficients are not the marginal effects. Due to the ripple effect of the spatial lag (multiple variables enter the derivatives), there are indirect effects as well. The sum of the direct and indirect effects is the total marginal effect. These are now reported in the paper.
+
+> In any case, there is the parameter that changes signs between cities. While number of rooms is significant and positive in Madrid and Barcelona, in Valencia the sign is consistently negative for all models. The negative sign could be due to consumer preferences or other conditions that are specific to Valencia.
+
+3.(d) Finally, I am wondering how the authors estimated the spatial model with matrices of size 44,270 x 44,270 etc. I assume that the authors use a concentrated log-likelihood approach.  
+
+> We estimated the spatial models with the `spatialreg::lagsarlm` function (R package {spatialreg}) which relies on maximum likelihood estimation of the spatial simultaneous autoregressive lag model y = $\rho$ Wy + X $\beta$ + e. According to the documentation "$\rho$ is found by `optimize()` first, and $\beta$ and other parameters by generalized least squares subsequently"; in other words, yes, the approach uses the concentrated log-likelihood. The spatial weight matrices are large but sparse; after revising the matrices to specify the weights using the inverse of the distance (see below), neighbors of order higher than 6 are small and can be filtered. With these conditions, estimation takes only a few minutes in a laptop with the following specs:
+
+```{r echo=FALSE}
+si <- sessionInfo()
+si$otherPkgs <- NULL
+si$loadedOnly <- NULL
+print(si)
+
+print(get_cpu())
+paste0("RAM: ", print(get_ram()))
+```
+
+# Fourth Comment 
+
+4.(a) I like the horse race among the different models including the spatial model. However, in case of the spatial autoregressive model (SAR), the exogenous variables can no longer be interpreted as causal effects. Moreover, it is not clear to me how this spatial specification affects the estimate parameter for the market segments. In particular, there might be a kind of interaction between the spatial weight matrix and the indicator for the market segments.
+
+> Thank you for this perceptive comment. Indeed, the variables in models with spatial autocorrelation cannot be interpreted as marginal effect. James LeSage and others have shown how the lagged variable creates a multiplier effect, and that the impacts on the dependent variable consist of a direct impact of the attribute, but also an indirect impact due to the multiplier. The sum of these two gives the total impact, which depending on the sign of the spatial autocorrelation parameter can be smaller or larger than the direct impact.
+
+> Comparison of models Market Segments/Spatial/Spatial with Market Segments indicates that the parameters vary depending on whether spatial heterogeneity, or spatial autocorrelation, or both effects are considered. It is well-known that spatial heterogeneity and association can co-exist [e.g., @Bourassa2007spatial; @Paez2001spatial], however, the two effects typically cannot be told apart a priori, and their presence is generally inferred from the empirical results. In our case studies, the improved fit suggests that spatial heterogeneity (i.e., the spatial market segments) are a better interpretation of the data than spatial autocorrelation alone, thus showing one possible interaction between spatial autocorrelation (and the weight matrix) and the indicators for market segments. In particular, once that heterogeneity is considered, the strength of spatial autocorrelation is reduced. The second way that the two effects interact is through the multiplier effect of spatial autocorrelation note above. As seen in Tables 3, 5, and 7 of the revised version of the paper, the total effect of each market segment is greater than the direct effect alone.  
+
+4.(b)I would like to see a discussion on how the estimates are influenced in their efficiency and consistency. In addition, the authors should test different spatial weight matrices such as distance- and neighborhood-based matrices. For instance, in case of Barcelona and Madrid the six-nearest neighbors definition might not be appropriate because there are areas with missing neighbors in between city areas, which leads to a meaningless long distance to the next direct neighbor.
+
+> This is a great suggestion. For the revisions, we have changed the specification of the spatial weights matrix from nearest neighbors to inverse distance. This has the effect of reducing the influence of more distant neighbors. Interestingly, the results appear to be robust to the specification of the matrix. To be sure, there are some changes in the estimated values of the parameters, but qualitatively the results are the same and none of our conclusions change.
+
+> We would like to thank you again for your thoughtful feedback, which has helped to improve the quality of the paper.
+
+# References
+
+
